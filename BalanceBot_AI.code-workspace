@@ -1,0 +1,11 @@
+{
+  "folders": [
+    { "name": "ESP CAN BANG (firmware/balance_esp)", "path": "firmware/balance_esp" },
+    { "name": "ESP CAM (firmware/cam_esp)", "path": "firmware/cam_esp" },
+    { "name": "PC - AI (pc)", "path": "pc" },
+    { "name": "GOC (bat, README, common)", "path": "." }
+  ],
+  "settings": {
+    "files.exclude": { "**/.pio": true, "**/__pycache__": true }
+  }
+}
