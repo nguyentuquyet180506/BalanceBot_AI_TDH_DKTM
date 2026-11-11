@@ -32,7 +32,7 @@ class TrajectoryPredictor:
         self.state = np.zeros((4, 1), dtype=np.float64)
         self.P = np.diag([100.0, 100.0, 1e4, 1e4])
 
-    # ── nội bộ ──
+    # ── Hàm nội bộ ──
     def _init_from(self, m):
         self.state = np.array([[m[0]], [m[1]], [0.0], [0.0]], dtype=np.float64)
         self.P = np.diag([100.0, 100.0, 1e4, 1e4])

@@ -5,9 +5,9 @@ import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from balancebot_udp import BalanceBotUDP, MAX_V, MAX_W, PING_S  
+from balancebot_udp import BalanceBotUDP, MAX_V, MAX_W, PING_S   # noqa: E402
 
-import _0_config as cfg  
+import _0_config as cfg   # noqa: E402
 
 
 def _approach(cur, goal, up, down):
@@ -65,6 +65,12 @@ class RobotLink:
         with self._lock:
             return self._action is not None
 
+    def is_still(self, v_thr=120.0):
+        t = self.bot.telemetry
+        if self.busy or not t.get("connected"):
+            return False
+        return (not t.get("moving")) and abs(float(t.get("v", 0.0))) < v_thr
+
     def claim(self):
         with self._lock:
             self._cur = [0.0, 0.0]
@@ -120,7 +126,7 @@ class RobotLink:
         self._thread.join(timeout=0.5)
         self.bot.close()
 
-    # ── luồng gửi 50 Hz ──
+    # ── Luồng gửi lệnh 50 Hz ──
     def _refresh_ip(self):
         if self._ip_provider is None:
             return

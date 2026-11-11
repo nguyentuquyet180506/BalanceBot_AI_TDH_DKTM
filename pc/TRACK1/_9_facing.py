@@ -6,7 +6,7 @@ NOSE, LEYE, REYE, LEAR, REAR, LS, RS, LH, RH = 0, 1, 2, 3, 4, 5, 6, 11, 12
 
 FRONT, BACK, SIDE_R, SIDE_L, UNK = "front", "back", "side_r", "side_l", "unk"
 
-CONCLUSIVE = (FRONT, BACK, SIDE_R)
+CONCLUSIVE = (FRONT, BACK, SIDE_R, SIDE_L) if cfg.SLEEVE_MODE else (FRONT, BACK, SIDE_R)
 
 VIEW_TEXT = {
     FRONT: "MAT",
@@ -72,6 +72,8 @@ def view_with_motion(view, motion_dir):
 
 
 def arms_for(view):
+    if cfg.SLEEVE_MODE:
+        return "both"
     if view == FRONT and cfg.ARMBAND_SINGLE_WHEN_FRONT:
         return "R"
     return "both" if cfg.ARMBAND_EITHER_ARM else "R"

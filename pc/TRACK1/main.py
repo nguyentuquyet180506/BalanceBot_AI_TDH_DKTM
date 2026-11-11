@@ -20,7 +20,8 @@ from _4_async_worker import init_async_face_thread, face_job_queue, face_result_
 from _5_tracking_utils import (
     match_face_to_person, get_box_center, capture_multi_angle_encodings_10s,
 )
-from _5_color_match import extract_all_features, compute_pursuit_score, is_good_pose_for_scan
+from _5_color_match import (extract_all_features, compute_pursuit_score, is_good_pose_for_scan, boost_colors, exposure_gamma,
+                            color_sim, shirt_hue_block, ARMBAND_DIAG, armband_presence)
 from _6_draw_stick import draw_stick_figure
 from _8_gesture import GestureClassifier, KeypointSmoother
 from _7_kal_fil import TrajectoryPredictor, box_overlap_ratio, gate_radius
@@ -29,7 +30,6 @@ from _9_facing import (raw_view, view_with_motion, FacingEstimator, arms_for, CO
 from _10_robot_link import RobotLink
 from _11_motion import FollowController, SearchPlanner, GestureManeuver
 
-from _5_color_match import HIST_BINS
 
 
 def _text_k(img):
@@ -48,23 +48,30 @@ def _put_label(img, text, x, y, bg, fg, scale=0.45):
     cv2.putText(img, text, (x + 3, y - base - 2), cv2.FONT_HERSHEY_SIMPLEX, sc, fg, 1)
 
 
-# ── 4 chế độ điều khiển ──
-MODE_MANUAL, MODE_GESTURE, MODE_FOLLOW, MODE_CAMERA = 1, 2, 3, 4
+# ── 5 chế độ điều khiển ──
+MODE_MANUAL, MODE_GESTURE, MODE_CAMERA, MODE_FOLLOW, MODE_FOLLOW_ARM = 1, 2, 3, 4, 5
+FOLLOW_MODES = (MODE_FOLLOW, MODE_FOLLOW_ARM)
+AI_MODES = (MODE_GESTURE,) + FOLLOW_MODES
 MODE_NAMES = {MODE_MANUAL: "TAY (web / can gat UDP)", MODE_GESTURE: "CU CHI (AI)",
-              MODE_FOLLOW: "BAM NGUOI (AI)", MODE_CAMERA: "CAM KHONG AI (do duong)"}
+              MODE_CAMERA: "CAM KHONG AI (do duong)", MODE_FOLLOW: "BAM NGUOI: AO + QUAN (AI)",
+              MODE_FOLLOW_ARM: "BAM NGUOI: AO + QUAN + TAY AO (AI)"}
 MODE_ALIASES = {"1": 1, "tay": 1, "manual": 1, "2": 2, "cuchi": 2, "cu chi": 2, "gesture": 2,
-                "3": 3, "bam": 3, "bamnguoi": 3, "bam nguoi": 3, "follow": 3, "4": 4, "cam": 4, "camera": 4}
+                "3": 3, "cam": 3, "camera": 3,
+                "4": 4, "bam": 4, "bamnguoi": 4, "bam nguoi": 4, "follow": 4, "aoquan": 4,
+                "5": 5, "bam3": 5, "bamday": 5, "bangtay": 5, "full": 5}
 JOYSTICK_SCRIPT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "balancebot_udp.py")
 SPEED_TB, TURN_TB = "Toc do tick/s", "Xoay do/s"
 TERMINAL_HELP = """
 ================= DOI CHE DO (go roi Enter) =================
   1 | tay     : dieu khien TAY (web / cua so can gat UDP), tat camera + AI
   2 | cuchi   : dieu khien bang CU CHI tay (AI)
-  3 | bam     : BAM NGUOI (AI), mat dau thi quay 30 do moi 6 s
-  4 | cam     : chi xem CAMERA (khong AI) de do duong, lai bang can gat / web
-  y : (che do 2, 3) chuyen tu WEBCAM MAY TINH sang CAM ESP de track (truoc do xe dung yen)
+  3 | cam     : chi xem CAMERA (khong AI) de do duong, lai bang can gat / web
+  4 | bam     : BAM NGUOI bang AO + QUAN (khong dung tay ao)
+  5 | bamday  : BAM NGUOI bang AO + QUAN + TAY AO
+                (4, 5: mat dau thi XOAY TAI CHO 10 do, dung yen 5 s, lap lai)
+  y : (che do 2, 4, 5) chuyen tu WEBCAM MAY TINH sang CAM ESP de track (truoc do xe dung yen)
   r : bo chu, quay lai tim chu bang webcam | x : DISARM khan cap | a : ARM | q : thoat | h : tro giup
-  (Cua so video: phim 1-4, X van dung; N, R, S, Q giu nguyen nhu cu)
+  (Cua so video: phim 1-5, X, N = dang ky mat, R, S = bat/tat cu chi, Q)
 =============================================================="""
 
 def _anchor(box, kpts):
@@ -182,7 +189,25 @@ class RobotTrackerPipeline:
         self._reacq_note = ""
         self._loss_gate_tids = set()
 
-        # ===== Chế độ điều khiển + gửi lệnh xuống xe (thêm mới; không đụng logic nhận diện / bám) =====
+        self._tent_tid = None
+        self._tent_noarm = 0
+        self._tent_cand, self._tent_cand_n = None, 0
+        self._tent_banned = {}
+        self._tent_hist = {}
+        self._creacq_tid, self._creacq_n = None, 0
+        self._scan_note = ""
+        self._scan_cache = (None, True, "")
+        self._scan_prev = None
+        self._shirt_block = None
+        self._handover_arm_ok = False
+        self._y_force_until = 0.0
+
+        self._fl_snap = None
+        self._backup = None
+        self._exp_cache = (None, None)
+        self._exp_gamma = None
+
+        # ===== Chế độ điều khiển + gửi lệnh xuống xe =====
         self.robot = RobotLink(ip_provider=lambda: self.esp_stream.target_ip)
         self.follow = FollowController()
         self.search = SearchPlanner()
@@ -242,6 +267,15 @@ class RobotTrackerPipeline:
         self._reacq_tid, self._reacq_n, self._reacq_h = None, 0, 0.0
         self._reacq_note = ""
         self._loss_gate_tids = set()
+        self._tent_tid, self._tent_noarm = None, 0
+        self._tent_cand, self._tent_cand_n = None, 0
+        self._tent_banned = {}
+        self._tent_hist = {}
+        self._creacq_tid, self._creacq_n = None, 0
+        self._scan_note, self._scan_cache, self._scan_prev = "", (None, True, ""), None
+        self._shirt_block = None
+        self._fl_snap = None
+        self._backup = None
 
         self._epoch += 1
         self.predictor.reset()
@@ -333,9 +367,10 @@ class RobotTrackerPipeline:
                     self.preview_colors = {}
 
                     if len(self.current_persons) > 0:
+                        face_img = self._face_frame(frame)
                         h_img, w_img = frame.shape[:2]
                         self.detector.setInputSize((w_img, h_img))
-                        _, faces = self.detector.detect(frame)
+                        _, faces = self.detector.detect(face_img)
                         self._face_dbg = []
 
                         if faces is not None and len(faces) > 0:
@@ -345,7 +380,7 @@ class RobotTrackerPipeline:
                                 if fw < 10 or fh < 10:
                                     continue
 
-                                is_sharp, blur_score = is_sharp_face(frame, (fx, fy, fw, fh))
+                                is_sharp, blur_score = is_sharp_face(face_img, (fx, fy, fw, fh))
                                 if not is_sharp:
                                     continue
 
@@ -363,7 +398,7 @@ class RobotTrackerPipeline:
                                 if matched_tid is not None and face_job_queue.empty():
                                     try:
                                         face_job_queue.put_nowait(
-                                            (frame, (fx, fy, fw, fh), matched_tid, is_profile, self._epoch)
+                                            (face_img, (fx, fy, fw, fh), matched_tid, is_profile, self._epoch)
                                         )
                                     except queue.Full:
                                         pass
@@ -422,6 +457,8 @@ class RobotTrackerPipeline:
                         self._track_with_memory(frame)
 
             # ===== HIỂN THỊ GIAO DIỆN =====
+            if cfg.EXPOSURE_SHOW and self.mode in AI_MODES:
+                display_frame = self._exposed(frame).copy()
             if (self.stick_mode or self.mode == MODE_GESTURE) and not self.is_typing_name:
                 self._handle_gesture(display_frame)
 
@@ -472,7 +509,7 @@ class RobotTrackerPipeline:
             else:
                 if self.master_features is None:
                     _put_text(display_frame,
-                                f"[DA NHAN DIEN: {self.target_name.upper()}] DANG QUET AO - HAY LUI RA DE LO AO...",
+                                f"[DA NHAN DIEN: {self.target_name.upper()}] DANG QUET AO - " + (self._scan_note.upper() or "HAY LUI RA DE LO AO..."),
                                 (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
                 else:
                     if self.lost_start_time is None:
@@ -497,9 +534,12 @@ class RobotTrackerPipeline:
 
             for t_id, [x1, y1, x2, y2] in self.current_persons:
                 if self.target_track_id is not None and t_id == self.target_track_id and self.lost_start_time is None:
-                    if self._target_armband_visible:
+                    if self._tent_tid is not None and t_id == self._tent_tid:
+                        owner_color = (0, 215, 255)
+                        lbl = f"TAM THEO: {self.target_name} (khong bang {self._tent_noarm}/{cfg.TENTATIVE_REJECT_FRAMES})"
+                    elif self._target_armband_visible:
                         owner_color = (0, 255, 0)
-                        lbl = f"CHU NHAN: {self.target_name} [CO BANG TAY]"
+                        lbl = f"CHU NHAN: {self.target_name} [DUNG TAY AO]"
                     else:
                         owner_color = (0, 165, 255)
                         lbl = f"CHU NHAN: {self.target_name}"
@@ -579,7 +619,7 @@ class RobotTrackerPipeline:
         print("Thoát hệ thống thành công!")
 
     # ------------------------------------------------------------------
-    #  CHẾ ĐỘ ĐIỀU KHIỂN + GỬI LỆNH XUỐNG XE (thêm mới)
+    #  CHẾ ĐỘ ĐIỀU KHIỂN + GỬI LỆNH XUỐNG XE
     # ------------------------------------------------------------------
     def _apply_mode(self, m):
         if m not in MODE_NAMES or m == self.mode:
@@ -595,24 +635,30 @@ class RobotTrackerPipeline:
         self.kp_smoother.reset()
         self._kp_smooth = None
         self._last_valid_pose_time = None
+        self._tent_tid, self._tent_noarm = None, 0
+        self._tent_cand, self._tent_cand_n = None, 0
+        self._backup = None
+        self._fl_snap = None
         self.stick_mode = (m == MODE_GESTURE)
         self._update_sources()
-        if m in (MODE_GESTURE, MODE_FOLLOW):
+        if m in AI_MODES:
             self._close_joystick()
             self.robot.claim()
         else:
             self.robot.release()
             self._open_joystick()
         print(f"\n>>> CHE DO {m}: {MODE_NAMES[m]}")
-        if m == MODE_FOLLOW:
-            print("    Xe bam chu (giu gan tam). Mat dau > %.0f s: quay %d do moi %.0f s." %
-                  (cfg.SEARCH_START_DELAY, cfg.SEARCH_TURN_DEG, cfg.SEARCH_PERIOD))
+        if m in FOLLOW_MODES:
+            print("    Bam bang: " + ("AO + QUAN (khong dung tay ao)" if m == MODE_FOLLOW else
+                                      "AO + QUAN + TAY AO (mat chu: dung ao + quan thi TAM THEO, khong thay tay ao thi bo)"))
+            print("    Xe bam chu (giu gan tam, nguoi cao ~%d%% khung). Mat dau > %.0f s: XOAY TAI CHO %d do, dung yen %.0f s, lap lai." %
+                  (round(cfg.FOLLOW_TARGET_H * 100), cfg.SEARCH_START_DELAY, cfg.SEARCH_TURN_DEG, cfg.SEARCH_PAUSE))
         elif m == MODE_GESTURE:
             print("    Tay phai gio: TIEN 3s | tay trai gio: LUI 3s | dang tay: quay %d do, chay 1s, quay lai | bat cheo: DUNG"
                   % cfg.GESTURE_SIDE_TURN_DEG)
         else:
             print(f"    Web: http://{self.esp_stream.target_ip or cfg.ROBOT_DEFAULT_IP}  (hoac http://192.168.4.1 qua Wi-Fi BalanceBot-Web)")
-        if m in (MODE_GESTURE, MODE_FOLLOW):
+        if m in AI_MODES:
             print("    " + ("Dang dung WEBCAM MAY TINH (xe dung yen) - bam Y de chuyen sang cam ESP" if self.source == "pc"
                             else "Dang track bang CAM ESP (R: quay lai webcam)"))
 
@@ -680,7 +726,7 @@ class RobotTrackerPipeline:
     def _mode_key(self, key):
         if key in (ord("q"), ord("Q")):
             return True
-        if ord("1") <= key <= ord("4"):
+        if ord("1") <= key <= ord("5"):
             self._apply_mode(key - ord("0"))
         elif key in (ord("s"), ord("S")) and self.mode != MODE_GESTURE:
             self._apply_mode(MODE_GESTURE)
@@ -698,7 +744,7 @@ class RobotTrackerPipeline:
         lines = [("CHE DO 1: DIEU KHIEN TAY (tat camera + AI)", (0, 255, 255), 0.6),
                  (f"Web: http://{ip}   |   Wi-Fi xe: http://192.168.4.1", (255, 255, 255), 0.5),
                  ("Cua so can gat UDP: " + ("DANG MO" if joy else "da dong -> dung web"), (255, 255, 255), 0.5),
-                 ("Doi che do: phim 2 / 3 / 4 o day hoac go trong terminal", (200, 200, 200), 0.5),
+                 ("Doi che do: phim 2 / 3 / 4 / 5 o day hoac go trong terminal", (200, 200, 200), 0.5),
                  ("X: DISARM khan cap  |  Q: thoat", (200, 200, 200), 0.5)]
         for i, (txt, col, sc) in enumerate(lines):
             _put_text(panel, txt, (15, 40 + i * 40), cv2.FONT_HERSHEY_SIMPLEX, sc, col, 1 if sc < 0.6 else 2)
@@ -707,16 +753,16 @@ class RobotTrackerPipeline:
 
     def _camera_screen(self, frame):
         h = frame.shape[0]
-        _put_text(frame, "[4] CAM KHONG AI - lai bang can gat / web", (10, 22),
+        _put_text(frame, "[3] CAM KHONG AI - lai bang can gat / web", (10, 22),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
-        _put_text(frame, "1-4: doi che do | X: DISARM | Q: thoat", (10, h - 12),
+        _put_text(frame, "1-5: doi che do | X: DISARM | Q: thoat", (10, h - 12),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
         cv2.imshow(self.MAIN_WIN_NAME, frame)
         return self._mode_key(cv2.waitKey(1) & 0xFF)
 
     # ── Nguồn ảnh: webcam máy tính (tìm / quét chủ) <-> cam ESP (track) ──
     def _update_sources(self):
-        ai = self.mode in (MODE_GESTURE, MODE_FOLLOW)
+        ai = self.mode in AI_MODES
         want_pc = ai and self.source == "pc"
         want_esp = self.mode == MODE_CAMERA or (ai and self.source == "esp")
         self.esp_stream.set_streaming(want_esp)
@@ -728,6 +774,7 @@ class RobotTrackerPipeline:
         new = self.pc_cam if want_pc else self.esp_stream
         if new is not self.cam_stream:
             self.cam_stream = new
+            self._exp_gamma = None
             self._last_frame_id = -1
             self._reset_yolo_tracker()
 
@@ -740,26 +787,42 @@ class RobotTrackerPipeline:
                 pass
 
     def _switch_to_esp(self):
-        if self.mode not in (MODE_GESTURE, MODE_FOLLOW):
-            print("[Y] Chi dung o che do 2 / 3")
+        if self.mode not in AI_MODES:
+            print("[Y] Chi dung o che do 2 / 4 / 5")
             return
         if self.source == "esp":
             print("[Y] Dang track bang cam ESP roi (R: bo chu, quay lai webcam)")
             return
         has_owner = self.target_track_id is not None
         feats = self.master_features
-        self._saved_owner = (self.target_name, feats) if has_owner else None
+        if has_owner and cfg.HANDOVER_REQUIRE_SCAN and not cfg.HANDOVER_RESCAN_COLORS:
+            need = ['shirt', 'pants'] + (['armband'] if self._use_armband() else [])
+            names = {'shirt': 'AO', 'pants': 'QUAN', 'armband': 'TAY AO'}
+            miss = [names[k] for k in need if not feats or k not in feats]
+            if miss and time.time() > self._y_force_until:
+                self._y_force_until = time.time() + cfg.HANDOVER_FORCE_WINDOW
+                print(f"[Y] CHUA CHUYEN: chua quet xong {'/'.join(miss)} tren webcam (can de XAC NHAN chu tren cam ESP). "
+                      f"Dung thang truoc webcam cho quet xong roi bam Y. Van muon chuyen: bam Y lan nua trong {cfg.HANDOVER_FORCE_WINDOW:.0f} s")
+                return
+            if miss and (not feats or 'shirt' not in feats):
+                print("[Y] Chua co mau ao -> tren cam ESP se tim chu bang MAT")
+                has_owner = False
+        self._saved_owner = (self.target_name, feats, dict(self.preview_colors)) if has_owner else None
+        keep_block = self._shirt_block if has_owner else None
         self._handover_colors = has_owner and feats is not None and not cfg.HANDOVER_RESCAN_COLORS
         self.reset_target_state()
+        self._shirt_block = keep_block
         self._handover = has_owner
         self._handover_tid, self._handover_n, self._handover_note = None, 0, "dung 1 MINH truoc cam ESP"
+        self._handover_arm_ok = False
         self.source = "esp"
         self._update_sources()
         if has_owner:
-            print(f"[Y] Chuyen sang CAM ESP: dung 1 MINH truoc xe de nhan lai chu '{self._saved_owner[0]}'"
-                  + (" (giu mau tu webcam)" if self._handover_colors else " (se quet lai mau ao tren cam ESP)"))
+            print(f"[Y] Chuyen sang CAM ESP: dung 1 MINH truoc xe, xe QUET XAC NHAN chu '{self._saved_owner[0]}'"
+                  + (" bang mau ao / quan" + (" / tay ao" if self._use_armband() else "") + " da nho (khong quet lai; anh ESP duoc phoi sang)"
+                     if self._handover_colors else " (se quet lai mau ao tren cam ESP)"))
         else:
-            print("[Y] Chuyen sang CAM ESP: chua co chu -> tim chu bang mat tren cam ESP nhu cu")
+            print("[Y] Chuyen sang CAM ESP: chua co chu -> tim chu bang mat tren cam ESP")
 
     def _restart_owner(self):
         self.reset_target_state()
@@ -770,28 +833,67 @@ class RobotTrackerPipeline:
             self._update_sources()
         print("[AI] Bo chu - tim / quet chu lai bang WEBCAM MAY TINH (xe dung yen; Y de chuyen sang cam ESP)")
 
+    def _handover_verify(self, frame, kpts, feats):
+        view, _ = raw_view(kpts, 0.0)
+        keys = tuple(k for k in feats if k != 'armband' or self._use_armband())
+        got = extract_all_features(self._color_frame(frame), kpts, only=keys, track=True,
+                                   arms=arms_for(view), sideways=view in (SIDE_R, SIDE_L))
+        hists = {k: v[0] for k, v in got.items() if v[0] is not None}
+        if 'shirt' not in hists:
+            return False, "chua thay ro AO (dung thang, lo vai + hong)", None
+        if cfg.HANDOVER_NEED_PANTS and 'pants' in feats and 'pants' not in hists:
+            return False, "chua thay ro QUAN (lui ra cho cam thay dau goi)", None
+        use = {k: feats[k] for k in keys}
+        self._handover_arm_pct = (armband_presence(use, hists) if ('armband' in use and 'armband' in hists) else None)
+        score, arm = compute_pursuit_score(use, hists)
+        if arm == 'mismatch':
+            if view in CONCLUSIVE:
+                return False, "TAY AO SAI MAU -> khong phai chu", arm
+            score, arm = compute_pursuit_score({k: v for k, v in use.items() if k != 'armband'}, hists)[0], 'unseen'
+        if score < cfg.HANDOVER_MIN_SCORE:
+            why = f"AO / QUAN CHUA KHOP (diem {max(score, 0):.2f} < {cfg.HANDOVER_MIN_SCORE:.2f})"
+            if cfg.SCAN_DEBUG:
+                parts = [f"{lbl} {color_sim(use[k], hists[k]):.2f}" for k, lbl in (('shirt', 'ao'), ('pants', 'quan'))
+                         if k in use and k in hists]
+                lim = f"loai neu ao < {cfg.SHIRT_MIN_CORR:.2f} / quan < {cfg.PANTS_MIN_CORR:.2f}"
+                why = f"CHUA KHOP: {' '.join(parts)} -> diem {max(score, 0):.2f} < {cfg.HANDOVER_MIN_SCORE:.2f} ({lim})"
+                box = next((b for t, b in self.current_persons), None)
+                net = self._sharpness(frame, box) if box is not None else None
+                if net is not None:
+                    why += f" | net {net:.0f}"
+            return False, why, arm
+        return True, "", arm
+
     def _handover_step(self, frame):
-        name, feats = self._saved_owner
+        name, feats, chip_colors = self._saved_owner
         if len(self.current_persons) != 1:
-            self._handover_tid, self._handover_n = None, 0
+            self._handover_tid, self._handover_n, self._handover_arm_ok = None, 0, False
             self._handover_note = "can DUNG 1 NGUOI truoc cam ESP" if self.current_persons else "chua thay ai"
             return
         tid, box = self.current_persons[0]
         kpts = self.person_kpts.get(tid)
-        if self._handover_colors and feats is not None:
-            view, _ = raw_view(kpts, 0.0)
-            got = extract_all_features(frame, kpts, only=tuple(feats.keys()), track=True,
-                                       arms=arms_for(view), sideways=view in (SIDE_R, SIDE_L))
-            score, _arm = compute_pursuit_score(feats, {k: v[0] for k, v in got.items() if v[0] is not None},
-                                                relax=cfg.OFFVIEW_RELAX)
-            if score < 0.0:
-                self._handover_tid, self._handover_n = None, 0
-                self._handover_note = "mau ao / bang tay khong khop"
-                return
-        self._handover_n = self._handover_n + 1 if self._handover_tid == tid else 1
+        if self._handover_tid != tid:
+            self._handover_n, self._handover_arm_ok = 0, False
         self._handover_tid = tid
-        self._handover_note = f"xac nhan {self._handover_n}/{cfg.HANDOVER_CONFIRM_TICKS}"
+        if self._handover_colors and feats is not None:
+            ok, why, arm = self._handover_verify(frame, kpts, feats)
+            if not ok:
+                self._handover_n, self._handover_arm_ok = 0, False
+                self._handover_note = why
+                return
+            if arm == 'match':
+                self._handover_arm_ok = True
+        self._handover_n += 1
+        need_arm = (self._handover_colors and feats is not None and self._use_armband() and 'armband' in feats
+                    and cfg.HANDOVER_NEED_ARMBAND)
+        self._handover_note = f"xac nhan ao + quan {min(self._handover_n, cfg.HANDOVER_CONFIRM_TICKS)}/{cfg.HANDOVER_CONFIRM_TICKS}"
         if self._handover_n < cfg.HANDOVER_CONFIRM_TICKS:
+            return
+        if need_arm and not self._handover_arm_ok:
+            self._handover_note = "ao + quan DUNG - gio tay ra cho cam thay TAY AO"
+            pct = getattr(self, '_handover_arm_pct', None)
+            if cfg.SCAN_DEBUG and pct is not None:
+                self._handover_note += f" (mau bang {100 * pct:.1f}%, can >= {100 * cfg.ARMBAND_MIN_AREA:.1f}%)"
             return
         self._handover = False
         self.target_track_id, self.target_name = tid, name
@@ -802,15 +904,18 @@ class RobotTrackerPipeline:
         self._last_good_time = time.time()
         if self._handover_colors:
             self.master_features = feats
+            self.preview_colors = dict(chip_colors)
         else:
             self.master_features = None
             self.preview_rois, self.preview_colors, self._sample_buf, self._sample_roi = {}, {}, {}, {}
         print(f"[ESP] Da nhan chu '{name}' tren cam ESP (ID {tid})")
 
-    # ── Thanh trượt tốc độ (chế độ 2, 3; mỗi chế độ nhớ số riêng) ──
+    # ── Thanh trượt tốc độ (chế độ 2, 4, 5; mỗi chế độ nhớ số riêng) ──
     def _init_sliders(self):
-        self._speed = {MODE_GESTURE: int(cfg.GESTURE_V), MODE_FOLLOW: int(cfg.FOLLOW_V_MAX)}
-        self._turn = {MODE_GESTURE: int(cfg.GESTURE_W), MODE_FOLLOW: int(cfg.FOLLOW_W_MAX)}
+        self._speed = {MODE_GESTURE: int(cfg.GESTURE_V), MODE_FOLLOW: int(cfg.FOLLOW_V_MAX),
+                       MODE_FOLLOW_ARM: int(cfg.FOLLOW_V_MAX)}
+        self._turn = {MODE_GESTURE: int(cfg.GESTURE_W), MODE_FOLLOW: int(cfg.FOLLOW_W_MAX),
+                      MODE_FOLLOW_ARM: int(cfg.FOLLOW_W_MAX)}
         self._slider_mode = None
         cv2.createTrackbar(SPEED_TB, self.MAIN_WIN_NAME, self._speed[MODE_FOLLOW], cfg.SPEED_SLIDER_MAX, lambda _v: None)
         cv2.createTrackbar(TURN_TB, self.MAIN_WIN_NAME, self._turn[MODE_FOLLOW], cfg.TURN_SLIDER_MAX, lambda _v: None)
@@ -849,7 +954,7 @@ class RobotTrackerPipeline:
         note = ""
         if self.mode == MODE_GESTURE:
             note = self._gesture_step(time.time())
-        elif self.mode == MODE_FOLLOW:
+        elif self.mode in FOLLOW_MODES:
             note = self._follow_step(time.time())
         self._draw_robot_hud(display_frame, note)
 
@@ -872,11 +977,16 @@ class RobotTrackerPipeline:
             if hold:
                 return hold
             return "cho nhan mat chu" if self.target_track_id is None else "dang quet ao - xe dung yen"
-        v_max, w_max = self._speed[MODE_FOLLOW], self._turn[MODE_FOLLOW]
+        v_max, w_max = self._speed[self.mode], self._turn[self.mode]
         if self.lost_start_time is not None:
+            backing = self._lost_backup_step(now, v_max)
+            if backing is not None:
+                return backing
             self.robot.stop()
-            return "TIM CHU: " + self.search.update(now, self.lost_start_time, self.follow.last_side, self.robot,
-                                                    w=min(cfg.SEARCH_TURN_W, w_max))
+            since = self.lost_start_time + (self._backup['dur'] if self._backup else 0.0)
+            people = [t for t, _b in self.current_persons if t not in self._tent_banned]
+            return "TIM CHU: " + self.search.update(now, since, self.follow.last_side, self.robot,
+                                                    w=min(cfg.SEARCH_TURN_W, w_max), people=people)
         self.search.reset()
         if self._crossing:
             self.robot.cancel_action()
@@ -887,9 +997,194 @@ class RobotTrackerPipeline:
             v, w = self.follow.update(self.last_known_center[0], self._last_box_h, self.frame_w, self.frame_h,
                                       v_max=v_max, w_max=w_max)
             self.robot.set_target(v, w)
-            return "bam: " + self.follow.dbg
+            self._fl_snap = {'t': now, 'v': v, 'hr': self.follow.last_hr,
+                             'approach': self.predictor.approach_rate()}
+            tent = "(TAM THEO ao+quan, cho tay ao) " if self._tent_tid is not None else ""
+            return "bam: " + tent + self.follow.dbg
         self.robot.stop()
         return "cho do vi tri chu"
+
+    # ── Chủ tiến sát rồi mất khỏi khung: lùi tiếp (chế độ 4, 5) ──
+    def _lost_backup_step(self, now, v_max):
+        lost = self.lost_start_time
+        if self._backup is None or self._backup['lost'] != lost:
+            snap = self._fl_snap
+            approaching = snap is not None and lost - snap['t'] <= cfg.LOST_BACKUP_MEMORY and (
+                snap['v'] < -1.0 or (snap['approach'] >= cfg.LOST_BACKUP_APPROACH and snap['hr'] >= cfg.LOST_BACKUP_MIN_H))
+            vb = min(float(cfg.LOST_BACKUP_V or cfg.FOLLOW_V_BACK_MAX), float(v_max))
+            go = bool(cfg.LOST_BACKUP and approaching and vb > 0)
+            self._backup = {'lost': lost, 'dur': cfg.LOST_BACKUP_TIME if go else 0.0, 'v': vb}
+            if go:
+                print(f"[BAM] Chu dang tien sat roi mat khoi khung -> xe LUI TIEP toi da {cfg.LOST_BACKUP_TIME:.1f}s ({vb:.0f} tick/s)")
+        b = self._backup
+        left = b['lost'] + b['dur'] - now
+        if left <= 0:
+            return None
+        self.search.reset()
+        self.robot.cancel_action()
+        self.robot.set_target(-b['v'], 0.0)
+        return f"CHU TIEN SAT -> XE LUI TIEP {left:.1f}s (cho chu hien lai trong khung)"
+
+    def _backed_up(self):
+        b = self._backup
+        return b is not None and b['dur'] > 0 and b['lost'] == self.lost_start_time
+
+    # ── Chế độ 4 / 5: xác định có dùng tay áo hay không ──
+    def _use_armband(self):
+        return self.mode == MODE_FOLLOW_ARM
+
+    def _master(self, feats=None):
+        mf = self.master_features if feats is None else feats
+        if mf is None or self._use_armband() or 'armband' not in mf:
+            return mf
+        return {k: v for k, v in mf.items() if k != 'armband'}
+
+    # ── Phơi sáng xử lý trên PC sau khi nhận ảnh (không đổi cấu hình cam OV) ──
+    def _exposed(self, frame):
+        if self._exp_cache[0] == self.frame_count and self._exp_cache[1] is not None:
+            return self._exp_cache[1]
+        g = exposure_gamma(frame, cfg.EXPOSURE_TARGET_V, cfg.EXPOSURE_GAMMA_MIN)
+        a = cfg.EXPOSURE_SMOOTH
+        self._exp_gamma = g if self._exp_gamma is None else (1 - a) * self._exp_gamma + a * g
+        gg = round(self._exp_gamma, 2)
+        if gg >= 0.995 and cfg.EXPOSURE_SAT_GAIN == 1.0:
+            img = frame
+        else:
+            img = boost_colors(frame, gg, cfg.EXPOSURE_SAT_GAIN, 60, cfg.EXPOSURE_DARK)
+        self._exp_cache = (self.frame_count, img)
+        return img
+
+    def _color_frame(self, frame):
+        if cfg.EXPOSURE_ESP_COLORS and self.cam_stream is self.esp_stream:
+            return self._exposed(frame)
+        return frame
+
+    def _face_frame(self, frame):
+        return self._exposed(frame) if cfg.EXPOSURE_FACE else frame
+
+    # ── Chế độ 5: bắt lại TẠM THEO bằng áo + quần ──
+    def _tentative_pick(self, viable, now):
+        if (not cfg.TENTATIVE_REACQ or self.mode != MODE_FOLLOW_ARM or not self._need_reconfirm
+                or not self.master_features or 'armband' not in self.master_features):
+            self._tent_cand, self._tent_cand_n = None, 0
+            return None
+        for k in [k for k, t in self._tent_banned.items() if now - t > cfg.TENTATIVE_BAN_TIME]:
+            del self._tent_banned[k]
+        ok = []
+        for c in viable:
+            seen = self._known_others.get(c['tid'])
+            if (c['tid'] in self._tent_banned or c['arm'] == 'mismatch' or not c.get('measured', True)
+                    or c['score'] < cfg.TENTATIVE_MIN_SCORE or (seen is not None and now - seen <= cfg.REACQ_KNOWN_TTL)):
+                continue
+            ok.append(c)
+        if not ok or (len(ok) > 1 and ok[1]['cost'] - ok[0]['cost'] < cfg.AMBIGUOUS_COST_MARGIN):
+            self._tent_cand, self._tent_cand_n = None, 0
+            return None
+        c = ok[0]
+        self._tent_cand_n = self._tent_cand_n + 1 if self._tent_cand == c['tid'] else 1
+        self._tent_cand = c['tid']
+        if self._tent_cand_n < cfg.TENTATIVE_CONFIRM_TICKS:
+            self._reacq_note = f"dung ao + quan, sap tam theo {self._tent_cand_n}/{cfg.TENTATIVE_CONFIRM_TICKS}"
+            return None
+        self._tent_cand, self._tent_cand_n = None, 0
+        self._tent_tid, self._tent_noarm = c['tid'], self._tent_hist.pop(c['tid'], 0)
+        self._pick_reason = 'tentative'
+        print(f"[BAM] Che do 5: TAM THEO ID {c['tid']} vi dung mau ao + quan (diem {c['score']:.2f}) - dang tim tay ao "
+              f"(thay ro tay ma khong dung mau tay ao {cfg.TENTATIVE_REJECT_FRAMES} lan thi bo)")
+        return c
+
+    # ── Chế độ 2, 4: nhận lại chủ bằng áo + quần ──
+    def _color_reacquire(self, viable, now):
+        if (not cfg.COLOR_REACQ or self.mode not in (MODE_GESTURE, MODE_FOLLOW) or not self._need_reconfirm or not self.master_features):
+            self._creacq_tid, self._creacq_n = None, 0
+            return None
+        ok = []
+        for c in viable:
+            seen = self._known_others.get(c['tid'])
+            if not c.get('measured', True) or c['score'] < cfg.COLOR_REACQ_MIN_SCORE:
+                continue
+            if seen is not None and now - seen <= cfg.REACQ_KNOWN_TTL:
+                continue
+            ok.append(c)
+        if not ok or (len(ok) > 1 and ok[1]['cost'] - ok[0]['cost'] < cfg.AMBIGUOUS_COST_MARGIN):
+            self._creacq_tid, self._creacq_n = None, 0
+            self._reacq_note = "2 nguoi cung mau ao + quan -> khong doan" if len(ok) > 1 else "cho nguoi dung ao + quan"
+            return None
+        c = ok[0]
+        self._creacq_n = self._creacq_n + 1 if self._creacq_tid == c['tid'] else 1
+        self._creacq_tid = c['tid']
+        if self._creacq_n < cfg.COLOR_REACQ_TICKS:
+            self._reacq_note = f"dung ao + quan, dang xac nhan {self._creacq_n}/{cfg.COLOR_REACQ_TICKS}"
+            return None
+        self._creacq_tid, self._creacq_n = None, 0
+        self._pick_reason = 'color'
+        print(f"[BAM] Che do {self.mode}: nhan lai chu = ID {c['tid']} (dung ao + quan, diem {c['score']:.2f})")
+        return c
+
+    # ── Chỉ có một người trong khung: bám theo người đó ──
+    def _solo_pick(self, cands):
+        tid1, box1 = self.current_persons[0]
+        c = next((c for c in cands if c['tid'] == tid1), None)
+        if tid1 != self.target_track_id:
+            pos = self.predictor.position()
+            if pos is not None:
+                ax, ay = _anchor(box1, self.person_kpts.get(tid1))
+                bh = max(box1[3] - box1[1], 1)
+                if np.hypot(ax - pos[0], ay - pos[1]) > gate_radius(bh, self.predictor.coast_time()):
+                    return None
+        if c is None:
+            c = {'tid': tid1, 'box': box1, 'score': cfg.VALID_ID_MIN_SCORE, 'arm': 'unseen', 'in_gate': True,
+                 'view': self._get_view(tid1), 'measured': False, 'cost': 1.0, 'arm_bad': False}
+        elif c['arm'] == 'mismatch':
+            c = dict(c, arm='unseen')
+        self._color_rej = 0
+        self._pick_reason = 'solo'
+        return c
+
+    # ── Điều kiện thuận lợi để QUÉT màu ──
+    def _sharpness(self, frame, box):
+        x1, y1, x2, y2 = (int(v) for v in box)
+        roi = frame[max(0, y1):max(0, y2), max(0, x1):max(0, x2)]
+        if roi.shape[0] < 20 or roi.shape[1] < 10:
+            return None
+        g = cv2.cvtColor(cv2.resize(roi, (max(8, int(roi.shape[1] * 160 / roi.shape[0])), 160)), cv2.COLOR_BGR2GRAY)
+        return float(cv2.Laplacian(g, cv2.CV_64F).var())
+
+    def _scan_check(self, frame, kpts, box, name='shirt'):
+        if self._scan_cache[0] != self.frame_count:
+            ok, why = True, ""
+            now = time.time()
+            anchor = _anchor(box, kpts)
+            bh = max(box[3] - box[1], 1)
+            prev, self._scan_prev = self._scan_prev, (now, anchor)
+            if cfg.SCAN_ALONE and len(self.current_persons) != 1:
+                ok, why = False, "chi 1 nguoi trong khung"
+            elif self._target_overlapped(box):
+                ok, why = False, "nguoi khac dang che"
+            elif cfg.SCAN_NEED_FRONT and raw_view(kpts, 0.0)[0] != FRONT:
+                ok, why = False, "quay mat ve camera"
+            elif prev is not None and 0 < now - prev[0] < 1.0 and (
+                    np.hypot(anchor[0] - prev[1][0], anchor[1] - prev[1][1]) / (now - prev[0]) / bh > cfg.SCAN_MAX_SPEED):
+                ok, why = False, "dung yen"
+            self._scan_cache = (self.frame_count, ok, why)
+        ok, why = self._scan_cache[1], self._scan_cache[2]
+        if not ok or name == 'armband':
+            return ok, why
+        fh, fw = frame.shape[:2]
+        if box[0] < cfg.SCAN_EDGE_MARGIN * fw or box[2] > fw * (1 - cfg.SCAN_EDGE_MARGIN):
+            return False, "dung vao giua khung"
+        ls, rs, lh, rh = kpts[5], kpts[6], kpts[11], kpts[12]
+        x1, x2 = int(min(ls[0], rs[0], lh[0], rh[0])), int(max(ls[0], rs[0], lh[0], rh[0]))
+        y1, y2 = int(min(ls[1], rs[1])), int(max(lh[1], rh[1]))
+        roi = self._color_frame(frame)[max(0, y1):max(0, y2), max(0, x1):max(0, x2)]
+        if roi.size >= 30:
+            v = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)[..., 2]
+            med, clip = float(np.median(v)), float((v >= 250).mean())
+            if med < cfg.SCAN_MIN_V:
+                return False, "thieu sang"
+            if med > cfg.SCAN_MAX_V or clip > cfg.SCAN_MAX_CLIPPED:
+                return False, "chay sang (tranh den / nang chieu thang)"
+        return True, ""
 
     def _draw_robot_hud(self, frame, note):
         h_img = frame.shape[0]
@@ -908,12 +1203,6 @@ class RobotTrackerPipeline:
             _put_text(frame, note, (10, h_img - 70), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 200, 0), 1)
 
     def _chip_color(self, name):
-        if name == "armband" and self.master_features is not None and "armband" in self.master_features:
-            h = self.master_features["armband"]
-            i, j, k = np.unravel_index(int(np.argmax(h)), h.shape)
-            hsv = np.uint8([[[min(179, (i + 0.5) * 180 / HIST_BINS[0]), min(255, (j + 0.5) * 256 / HIST_BINS[1]),
-                              min(255, (k + 0.5) * 256 / HIST_BINS[2])]]])
-            return tuple(int(c) for c in cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)[0, 0])
         return self.preview_colors.get(name)
 
     def _draw_color_chips(self, frame):
@@ -930,6 +1219,11 @@ class RobotTrackerPipeline:
         for i, name in enumerate(("shirt", "pants", "armband")):
             x = x0 + i * (sz + gap)
             col = self._chip_color(name)
+            if name == "armband" and not self._use_armband():
+                cv2.rectangle(frame, (x, margin), (x + sz, margin + sz), (110, 110, 110), 1)
+                cv2.line(frame, (x, margin), (x + sz, margin + sz), (110, 110, 110), 1)
+                cv2.line(frame, (x + sz, margin), (x, margin + sz), (110, 110, 110), 1)
+                continue
             if col is not None:
                 cv2.rectangle(frame, (x, margin), (x + sz, margin + sz), col, -1)
                 cv2.rectangle(frame, (x, margin), (x + sz, margin + sz), (255, 255, 255), 1)
@@ -962,9 +1256,10 @@ class RobotTrackerPipeline:
             elif kpts is None or self.lost_start_time is not None:
                 why = "khong thay chu nhan"
             elif self._need_reconfirm:
-                why = "cho xac nhan lai chu (thay bang tay hoac chay sat cam, khong co nguoi khac)"
+                why = ("cho xac nhan lai chu (thay tay ao hoac chay sat cam, khong co nguoi khac)" if self._use_armband()
+                       else "cho xac nhan lai chu (dung ao + quan vai luot lien tiep)")
             else:
-                why = "chua thay bang tay khop (xoay tay phai ra phia camera)"
+                why = "chua thay tay ao khop (xoay tay ra phia camera)"
             _put_text(display_frame, f"CU CHI: CHUA NHAN LENH - {why}", (10, h_img - 45),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (170, 170, 170), 1)
         elif not self.stick_mode:
@@ -1025,26 +1320,44 @@ class RobotTrackerPipeline:
             return
 
         buf = self._sample_buf.setdefault(name, [])
-        if not is_good_pose_for_scan(kpts, name) or self._target_overlapped(box):
+        ok, why = self._scan_check(frame, kpts, box, name)
+        if ok and not is_good_pose_for_scan(kpts, name):
+            ok, why = False, {'shirt': "dung thang, lo ro vai + hong", 'pants': "lui ra cho thay dau goi",
+                              'armband': "lo ro bap tay (vai -> khuyu)"}.get(name, "dung thang")
+        if not ok:
             buf.clear()
+            self._scan_note = why
             return
 
-        hist, roi, mean_bgr = extract_all_features(frame, kpts, only=(name,))[name]
+        cframe = self._color_frame(frame)
+        hist, roi, mean_bgr = extract_all_features(cframe, kpts, only=(name,), shirt_block=self._shirt_block)[name]
         if hist is None:
             buf.clear()
+            if name == 'armband':
+                self._scan_note = ("TAY AO " + ARMBAND_DIAG['txt']) if cfg.SCAN_DEBUG else "chua thay tay ao noi bat, KHAC mau ao"
+                net = self._sharpness(cframe, box) if cfg.SCAN_DEBUG else None
+                if net is not None:
+                    self._scan_note += f" | net {net:.0f}"
+            else:
+                self._scan_note = f"chua lay duoc mau {name}"
             return
 
-        if buf and cv2.compareHist(buf[0], hist, cv2.HISTCMP_CORREL) < cfg.FEATURE_SAMPLE_MIN_CORR:
+        sim = color_sim(buf[0], hist) if buf else 1.0
+        if sim < cfg.FEATURE_SAMPLE_MIN_CORR:
             buf.clear()
         buf.append(hist)
         self._sample_roi[name] = (roi, mean_bgr)
+        self._scan_note = f"giu yen, dang quet {name} {len(buf)}/{cfg.FEATURE_SAMPLES_NEEDED}"
         if len(buf) < cfg.FEATURE_SAMPLES_NEEDED:
             return
+        self._scan_note = ""
 
         avg = cv2.normalize(np.mean(buf, axis=0).astype(np.float32), None, 0, 1, cv2.NORM_MINMAX)
         if self.master_features is None:
             self.master_features = {}
         self.master_features[name] = avg
+        if name == 'shirt':
+            self._shirt_block = shirt_hue_block(cframe, kpts)
         roi_last, bgr = self._sample_roi[name]
         self.preview_rois[name] = cv2.resize(roi_last, (80, 80))
         self.preview_colors[name] = (int(bgr[0]), int(bgr[1]), int(bgr[2]))
@@ -1068,12 +1381,13 @@ class RobotTrackerPipeline:
             self._collect_feature('shirt', frame, self.person_kpts[self.target_track_id], box)
 
     def _capture_missing_features(self, frame, box):
-        missing = [n for n in ('pants', 'armband') if n not in self.master_features]
+        wanted = ('pants', 'armband') if self._use_armband() else ('pants',)
+        missing = [n for n in wanted if n not in self.master_features]
         if not missing:
             return
         tid = self.target_track_id
         if len(self.current_persons) > 1:
-            score, _ = compute_pursuit_score(self.master_features, self._get_cand_hists(frame, tid))
+            score, _ = compute_pursuit_score(self._master(), self._get_cand_hists(frame, tid))
             if score < cfg.FEATURE_CAPTURE_MIN_SCORE:
                 return
         for n in missing:
@@ -1084,6 +1398,7 @@ class RobotTrackerPipeline:
         coast = self.predictor.coast_time()
         ref = pred if pred is not None else self.last_known_center
         cands, seen = [], set()
+        master = self._master()
 
         for t_id, box in self.current_persons:
             if t_id not in self.person_kpts:
@@ -1093,11 +1408,13 @@ class RobotTrackerPipeline:
             view = self._get_view(t_id)
             is_cur = (t_id == self.target_track_id)
             relax = cfg.OFFVIEW_RELAX if (is_cur and view in (BACK, SIDE_R, SIDE_L)) else 1.0
-            pursuit = lambda h, **kw: compute_pursuit_score(self.master_features, h, relax=relax, **kw)
+            pursuit = lambda h, **kw: compute_pursuit_score(master, h, relax=relax, **kw)
 
             score, arm = pursuit(hists)
-            if (arm == 'match' and view == SIDE_L) or (arm == 'mismatch' and view not in CONCLUSIVE):
+            if ((arm == 'match' and view == SIDE_L and not cfg.SLEEVE_MODE)
+                    or (arm == 'mismatch' and view not in CONCLUSIVE)):
                 score, arm = pursuit({k: v for k, v in hists.items() if k != 'armband'})
+            arm_bad = (arm == 'mismatch')
 
             if arm == 'mismatch':
                 n = self._arm_mismatch.get(t_id, 0) + 1
@@ -1127,6 +1444,7 @@ class RobotTrackerPipeline:
                 dist, in_gate = d / bh, d <= gate_radius(bh, coast)
 
             cands.append({'tid': t_id, 'box': box, 'score': score, 'arm': arm, 'in_gate': in_gate, 'view': view,
+                          'arm_bad': arm_bad,
                           'measured': 'shirt' in hists,
                           'cost': cfg.W_COLOR * (1.0 - score) + cfg.W_DIST * dist})
 
@@ -1140,7 +1458,7 @@ class RobotTrackerPipeline:
             return None
         cur = next((c for c in viable if c['tid'] == tid), None)
 
-        # ---- (1) Băng tay khớp = bằng chứng mạnh nhất ----
+        # ---- (1) Tay áo khớp = bằng chứng mạnh nhất ----
         matched = [c for c in viable if c['arm'] == 'match']
         if not matched:
             self._match_tid, self._match_n = None, 0
@@ -1164,8 +1482,12 @@ class RobotTrackerPipeline:
                 return cur
             return None
 
-        # ---- (2) Đang chờ xác nhận lại (sau cắt nhau / mất dấu) mà không có băng tay khớp ----
+        # ---- (2) Đang chờ xác nhận lại (sau cắt nhau / mất dấu) mà không có tay áo khớp ----
         if self._need_reconfirm:
+            if (self._tent_tid is not None and cur is not None and cur['tid'] == self._tent_tid
+                    and cur['arm'] != 'mismatch' and cur['score'] >= cfg.VALID_ID_MIN_SCORE):
+                self._pick_reason = 'tentative'
+                return cur
             return None
 
         # ---- (3) ID chủ đã biến mất khỏi danh sách: có thể chỉ là YOLO gán nhãn ID mới cho cùng 1 người ----
@@ -1193,12 +1515,13 @@ class RobotTrackerPipeline:
         if ok is None:
             return fail("khong co moc 'chac la chu'")
         if self._contested:
-            return fail("co nguoi chen vao -> chi con bang tay khop")
-        if now - ok['t'] > cfg.REACQ_MAX_LOST:
-            return fail("mat qua lau -> chi con bang tay khop")
+            return fail("co nguoi chen vao -> chi con tay ao khop")
+        backed = self._backed_up()
+        if now - ok['t'] > cfg.REACQ_MAX_LOST + (cfg.LOST_BACKUP_TIME if backed else 0.0):
+            return fail("mat qua lau -> chi con tay ao khop")
         fh = frame.shape[0]
-        if not (ok['approach'] >= cfg.REACQ_APPROACH_RATE or ok['h'] >= cfg.REACQ_CLOSE_FRAC * fh):
-            return fail("luc mat chu khong chay sat cam -> cho bang tay khop")
+        if not backed and not (ok['approach'] >= cfg.REACQ_APPROACH_RATE or ok['h'] >= cfg.REACQ_CLOSE_FRAC * fh):
+            return fail("luc mat chu khong chay sat cam -> cho tay ao khop")
 
         ref = self.predictor.position() or ok['anchor']
         if ref is None:
@@ -1214,17 +1537,17 @@ class RobotTrackerPipeline:
         self._loss_gate_tids.update(p['tid'] for p in inside)
         if len(self._loss_gate_tids) > 1:
             self._contested = True
-            return fail("co nguoi chen vao cong luc mat chu -> chi con bang tay khop")
+            return fail("co nguoi chen vao cong luc mat chu -> chi con tay ao khop")
         if len(inside) > 1:
             self._contested = True
-            return fail("nhieu nguoi trong cong -> chi con bang tay khop")
+            return fail("nhieu nguoi trong cong -> chi con tay ao khop")
         if not inside:
             return fail("chua thay ai trong cong")
         cand = inside[0]
         for p in people:
             if p is not cand and box_overlap_ratio(cand['box'], p['box']) > cfg.CROSS_OVERLAP:
                 self._contested = True
-                return fail("co nguoi chong len -> chi con bang tay khop")
+                return fail("co nguoi chong len -> chi con tay ao khop")
         seen = self._known_others.get(cand['tid'])
         if seen is not None and now - seen <= cfg.REACQ_KNOWN_TTL:
             return fail("day la nguoi da dung canh chu (nguoi la)")
@@ -1236,10 +1559,12 @@ class RobotTrackerPipeline:
             return fail("nguoi xuat hien o cho khac cho chu bien mat")
         c = next((c for c in cands if c['tid'] == cand['tid']), None)
         if c is None:
-            return fail("bi mau / bang tay loai")
-        if cand['bh'] < ok['h'] * cfg.REACQ_H_MIN:
+            return fail("bi mau / tay ao loai")
+        h_min = cfg.REACQ_H_MIN_BACKUP if backed else cfg.REACQ_H_MIN
+        if cand['bh'] < ok['h'] * h_min:
             return fail("nguoi o xa hon luc chu bien mat")
-        if self._reacq_tid == cand['tid'] and cand['bh'] < self._reacq_h * 0.95:
+        robot_backing = backed and not self.robot.is_still(cfg.SEARCH_STILL_V)
+        if self._reacq_tid == cand['tid'] and cand['bh'] < self._reacq_h * 0.95 and not robot_backing:
             return fail("nguoi dang lui xa")
 
         self._reacq_n = self._reacq_n + 1 if self._reacq_tid == cand['tid'] else 1
@@ -1315,8 +1640,11 @@ class RobotTrackerPipeline:
                 if ms['sideways']:
                     parts.append("DI NGANG " + ("->PHAI" if ms['dir'] > 0 else "->TRAI"))
                 parts.append(f"TIEN-SAT-CAM:{ms['approach']:+.2f}")
-        if self._need_reconfirm:
-            parts.append("BAM LAI: " + (self._reacq_note or "cho bang tay khop / chu chay sat cam"))
+        if self._tent_tid is not None:
+            parts.append(f"TAM THEO ao+quan - dang tim tay ao (thay ro tay khong dung mau {self._tent_noarm}/{cfg.TENTATIVE_REJECT_FRAMES})")
+        elif self._need_reconfirm:
+            parts.append("BAM LAI: " + (self._reacq_note or ("cho tay ao khop / chu chay sat cam" if self._use_armband()
+                                                             else "cho nguoi dung ao + quan")))
         return " | ".join(parts)
 
     def _get_view(self, t_id):
@@ -1361,14 +1689,36 @@ class RobotTrackerPipeline:
         self._crossing = False
 
         cands = self._eval_candidates(frame)
-        kal_expired = self.predictor.coast_time() >= cfg.GATE_MAX_COAST
-        viable = sorted((c for c in cands if c['in_gate'] or c['arm'] == 'match' or kal_expired),
-                        key=lambda c: c['cost'])
-        best = self._pick_candidate(viable, tid)
+        best = None
+        if (cfg.SOLO_TRUST and len(self.current_persons) == 1 and self.lost_start_time is None
+                and not self._need_reconfirm):
+            best = self._solo_pick(cands)
         if best is None:
-            best = self._reacquire_by_approach(frame, cands, now)
+            kal_expired = self.predictor.coast_time() >= cfg.GATE_MAX_COAST
+            viable = sorted((c for c in cands if c['in_gate'] or c['arm'] == 'match' or kal_expired),
+                            key=lambda c: c['cost'])
+            best = self._pick_candidate(viable, tid)
+            if best is None:
+                best = self._reacquire_by_approach(frame, cands, now)
+            if best is None:
+                best = self._tentative_pick(viable, now)
+            if best is None:
+                best = self._color_reacquire(viable, now)
 
+        if best is not None and self._pick_reason == 'tentative':
+            if best.get('arm_bad'):
+                self._tent_noarm += 1
+            if self._tent_noarm >= cfg.TENTATIVE_REJECT_FRAMES:
+                print(f"[BAM] Che do 5: {self._tent_noarm} lan thay RO tay ma KHONG dung mau tay ao -> chac chan khong phai chu, "
+                      f"BO ID {best['tid']}, tim lai")
+                self._tent_banned[best['tid']] = now
+                self._tent_tid, self._tent_noarm = None, 0
+                self._fl_snap = None
+                best = None
         if best is None:
+            if self._tent_tid is not None:
+                self._tent_hist[self._tent_tid] = self._tent_noarm
+            self._tent_tid, self._tent_noarm = None, 0
             self._target_armband_visible = False
             self._armband_ok_until = 0.0
             soft = (not self._need_reconfirm and self._last_good_time is not None
@@ -1385,10 +1735,14 @@ class RobotTrackerPipeline:
             self.target_track_id = best['tid']
             self.kp_smoother.reset()
             self._kp_smooth = None
-        if self._pick_reason in ('match', 'approach'):
+        if self._pick_reason in ('match', 'approach', 'color'):
+            if self._tent_tid is not None and self._pick_reason == 'match':
+                print(f"[BAM] Che do 5: thay TAY AO khop -> xac nhan ID {best['tid']} la chu")
             self._need_reconfirm = False
             self._contested = False
             self._reacq_tid, self._reacq_n, self._reacq_note = None, 0, ""
+            self._tent_tid, self._tent_noarm = None, 0
+            self._tent_hist = {}
 
         self.lost_start_time = None
         self._loss_gate_tids = set()
@@ -1410,13 +1764,16 @@ class RobotTrackerPipeline:
             self._capture_missing_features(frame, best['box'])
 
     def _memory_text(self):
-        names = {'shirt': 'AO', 'pants': 'QUAN', 'armband': 'BANG TAY'}
+        names = {'shirt': 'AO', 'pants': 'QUAN', 'armband': 'TAY AO'}
         return "+".join(names[k] for k in names if self.master_features and k in self.master_features) or "-"
 
     def _missing_hint(self):
-        miss = [n for k, n in (('pants', 'QUAN'), ('armband', 'BANG TAY (DEO BANG MAU RUC)'))
-                if self.master_features and k not in self.master_features]
-        return (" | DUNG THANG DE QUET " + "/".join(miss)) if miss else ""
+        miss = [n for k, n in (('pants', 'QUAN'), ('armband', 'TAY AO (MAU RUC, KHAC THAN AO)'))
+                if self.master_features and k not in self.master_features
+                and (k != 'armband' or self._use_armband())]
+        if not miss:
+            return ""
+        return " | DUNG THANG DE QUET " + "/".join(miss) + ((" - " + self._scan_note.upper()) if self._scan_note else "")
 
     def _watchdog_check(self):
         if not self.stick_mode or self.robot_command in ("DUNG", "DUNG TAI VI TRI"):
@@ -1429,14 +1786,15 @@ class RobotTrackerPipeline:
         kpts = self.person_kpts.get(t_id)
         if kpts is None:
             return {}
-        keys = tuple(self.master_features.keys()) if self.master_features else ('shirt',)
+        master = self._master()
+        keys = tuple(master.keys()) if master else ('shirt',)
         view = self._get_view(t_id)
         arms = arms_for(view)
         sideways = view in (SIDE_R, SIDE_L)
         cache_key = (t_id, keys, arms, sideways)
         cached = self._hist_cache.get(cache_key)
         if cached is None:
-            feats = extract_all_features(frame, kpts, only=keys, track=True, arms=arms, sideways=sideways)
+            feats = extract_all_features(self._color_frame(frame), kpts, only=keys, track=True, arms=arms, sideways=sideways)
             cached = {k: v[0] for k, v in feats.items() if v[0] is not None}
             self._hist_cache[cache_key] = cached
         return cached

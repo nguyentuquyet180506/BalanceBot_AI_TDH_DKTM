@@ -32,7 +32,7 @@ constexpr int PIN_ENC_L_A = 4;
 constexpr int PIN_ENC_L_B = 5;
 constexpr int PIN_ENC_R_A = 6;
 constexpr int PIN_ENC_R_B = 7;
-// ===== CHIỀU MOTOR VÀ CẢM BIẾN: ĐÃ KHỚP XE, KHÔNG ĐỔI KHI CHỈNH GAIN =====
+// ===== CHIỀU MOTOR VÀ CẢM BIẾN (THEO PHẦN CỨNG XE, ĐỘC LẬP VỚI GAIN) =====
 constexpr bool  MOTOR_L_INVERT = false;
 constexpr bool  MOTOR_R_INVERT = true;
 constexpr bool  ENC_L_INVERT   = false;
@@ -149,7 +149,7 @@ void publishSnapshot(){
   portENTER_CRITICAL(&exchangeMux);published=s;portEXIT_CRITICAL(&exchangeMux);
 }
 
-// ==================== 03. MPU: GIỮ NGUYÊN TRỤC VÀ BỘ LỌC ====================
+// ==================== 03. MPU: ĐỌC CẢM BIẾN, HIỆU CHUẨN GYRO VÀ BỘ LỌC GÓC ====================
 constexpr uint8_t MPU_ADDR   = 0x68;
 constexpr float   GYRO_SCALE = 1.0f / 65.5f;
 constexpr float   RAD2DEG    = 57.2957795f;

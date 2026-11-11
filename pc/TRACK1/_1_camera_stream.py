@@ -16,6 +16,10 @@ if sys.platform.startswith("win"):
 
 ESP_PORT = 4210
 HDR = struct.Struct("<HHHH")
+LATE_WINDOW = 16
+REDISCOVER_AFTER = 3.0
+DIAG_EVERY = 5.0
+ESP_MSG = b"ESP32_CAM_"
 
 
 def get_broadcast_targets():
@@ -28,6 +32,10 @@ def get_broadcast_targets():
     except Exception:
         pass
     return list(targets)
+
+
+def _log(msg):
+    print(time.strftime("[%H:%M:%S] ") + "[CAM ESP] " + msg, flush=True)
 
 
 class ThreadedCamera:
@@ -52,16 +60,20 @@ class ThreadedCamera:
         self._last_new_frame_time = None
         self.stopped = False
         self._stream_on = bool(streaming)
+        self._stream_on_since = time.monotonic()
 
         self._frame_buffer = deque(maxlen=6)
 
-        self.stat = {"ok": 0, "incomplete": 0, "badjpg": 0}
+        self.stat = {"ok": 0, "incomplete": 0, "badjpg": 0, "pkts": 0, "connreset": 0}
+        self._last_rx_any = None
+        self._esp_status = ""
+        self._esp_status_t = None
+        self._send_err = ""
+        self._lost_logged = False
+        self._diag_t = 0.0
+        self._diag_snap = dict(self.stat)
 
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        self.sock.settimeout(0.5)
-        self.sock.bind(("", 0))
+        self.sock = self._new_socket()
 
         self.broadcast_ips = get_broadcast_targets()
         self._keepalive_thread = None
@@ -72,34 +84,94 @@ class ThreadedCamera:
         else:
             print(f"[1/6] Đang tự động dò tìm ESP32-CAM trên mạng WiFi (Port {self.port})...")
 
+    @staticmethod
+    def _new_socket():
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock.settimeout(0.5)
+        sock.bind(("", 0))
+        return sock
+
+    def _reopen_socket(self, why):
+        _log(f"Loi socket nhan anh ({why}) -> tao lai socket")
+        try:
+            new = self._new_socket()
+        except OSError as e:
+            _log(f"Chua tao lai duoc socket: {e} -> thu lai sau 1 s")
+            time.sleep(1.0)
+            return
+        old, self.sock = self.sock, new
+        try:
+            old.close()
+        except OSError:
+            pass
+        self._send_hello(0, broadcast=True)
+
+    def _send_hello(self, loss, broadcast=False):
+        msg = f"HELLO {loss}".encode("ascii")
+        with self._lock:
+            current_ip = self.target_ip
+        dests = [current_ip] if current_ip else []
+        if broadcast or not current_ip:
+            dests += self.broadcast_ips
+        err = ""
+        for d in dests:
+            try:
+                self.sock.sendto(msg, (d, self.port))
+            except OSError as e:
+                err = f"gui HELLO toi {d} loi: {e}"
+        self._send_err = err
+
     def _keepalive_loop(self):
         prev_ok = prev_bad = 0
         while not self._stop_event.is_set():
             with self._lock:
                 ok, bad = self.stat["ok"], self.stat["incomplete"]
-                current_ip = self.target_ip
-
             d_ok, d_bad = ok - prev_ok, bad - prev_bad
             prev_ok, prev_bad = ok, bad
             loss = int(100 * d_bad / (d_ok + d_bad)) if (d_ok + d_bad) else 0
             if not self._stream_on:
                 time.sleep(1.0)
                 continue
-            msg = f"HELLO {loss}".encode("ascii")
-
-            try:
-                if current_ip:
-                    self.sock.sendto(msg, (current_ip, self.port))
-                else:
-                    for b_ip in self.broadcast_ips:
-                        try:
-                            self.sock.sendto(msg, (b_ip, self.port))
-                        except OSError:
-                            pass
-            except OSError:
-                pass
-
+            now = time.monotonic()
+            gap = self._no_frame_for(now)
+            self._send_hello(loss, broadcast=gap >= REDISCOVER_AFTER)
+            if gap >= REDISCOVER_AFTER and now - self._diag_t >= DIAG_EVERY:
+                self._diag_t = now
+                _log(self._diagnose(now, gap))
             time.sleep(1.0)
+
+    def _no_frame_for(self, now):
+        with self._lock:
+            last = self._last_new_frame_time
+        ref = self._stream_on_since if last is None else max(last, self._stream_on_since)
+        return now - ref
+
+    def _diagnose(self, now, gap):
+        with self._lock:
+            st = dict(self.stat)
+            ip = self.target_ip
+        d = {k: st[k] - self._diag_snap.get(k, 0) for k in st}
+        self._diag_snap = st
+        head = f"KHONG CO HINH {gap:.0f}s (ESP {ip or 'chua biet IP'}:{self.port}). "
+        esp_recent = self._esp_status and self._esp_status_t is not None and now - self._esp_status_t <= DIAG_EVERY + 2
+        if esp_recent:
+            return head + "ESP co tra loi nhung bao: " + self._esp_status
+        if d["incomplete"] > 0 and d["ok"] == 0:
+            return head + (f"Nhan duoc goi anh nhung {d['incomplete']} khung deu THIEU GOI (mat goi Wi-Fi: song yeu / nghen / "
+                           "ESP qua nong). Thu dua xe lai gan router.")
+        if d["badjpg"] > 0 and d["ok"] == 0:
+            return head + f"Nhan du goi nhung {d['badjpg']} anh JPEG HONG (giai ma loi) - cam bien / cap cam co the bi loi."
+        if self._last_rx_any is not None and now - self._last_rx_any < gap:
+            return head + "ESP con lien lac (co goi tra loi) nhung khong gui anh - xem log Serial cua ESP cam (monitor_cam.bat)."
+        why = ("ESP tat / dang khoi dong lai / chua vao Wi-Fi; may tinh khac mang Wi-Fi voi ESP; "
+               "hoac tuong lua Windows chan UDP 4210 (chay fix_firewall.bat, cho phep python.exe).")
+        if d["connreset"] > 0:
+            why = f"Windows bao cong 4210 cua ESP dang DONG ({d['connreset']} lan) = ESP dang khoi dong lai / chua chay xong. " + why
+        if self._send_err:
+            why = self._send_err + ". " + why
+        return head + "KHONG nhan duoc goi nao tu ESP (da gui HELLO" + (" + broadcast" if gap >= REDISCOVER_AFTER else "") + "). " + why
 
     def _net_loop(self):
         cur_id = None
@@ -112,37 +184,52 @@ class ThreadedCamera:
                 data, addr = self.sock.recvfrom(2048)
             except socket.timeout:
                 continue
-            except OSError:
-                break
+            except ConnectionResetError:
+                with self._lock:
+                    self.stat["connreset"] += 1
+                continue
+            except OSError as e:
+                if self._stop_event.is_set():
+                    break
+                self._reopen_socket(e)
+                cur_id, chunks, total, done = None, {}, 0, False
+                continue
 
             sender_ip = addr[0]
+            now = time.monotonic()
 
-            if data.startswith(b"ESP32_CAM_BEACON"):
-                with self._lock:
-                    if self.target_ip != sender_ip:
-                        self.target_ip = sender_ip
-                        print(f"-> [UDP] Đã phát hiện ESP32-S3 Beacon tại IP: {sender_ip}")
+            if data.startswith(ESP_MSG):
+                self._last_rx_any = now
+                self._learn_ip(sender_ip, "goi tra loi")
+                if data.startswith(b"ESP32_CAM_STATUS"):
+                    txt = data[len(b"ESP32_CAM_STATUS"):].decode("ascii", "replace").strip()
+                    if txt != self._esp_status:
+                        _log("ESP bao: " + txt)
+                    self._esp_status, self._esp_status_t = txt, now
                 continue
 
             if len(data) < HDR.size:
                 continue
 
-            with self._lock:
-                if self.target_ip is None:
-                    self.target_ip = sender_ip
-                    print(f"-> [UDP] Đã nhận luồng video từ ESP32 tại IP: {sender_ip}")
-
             fid, idx, tot, plen = HDR.unpack_from(data)
             payload = data[HDR.size : HDR.size + plen]
             if len(payload) != plen or tot == 0 or idx >= tot:
                 continue
+            self._last_rx_any = now
+            self._learn_ip(sender_ip, "luong anh")
+            with self._lock:
+                self.stat["pkts"] += 1
 
             if cur_id is None or fid != cur_id:
-                if cur_id is not None and ((fid - cur_id) & 0xFFFF) >= 0x8000:
-                    continue
-                if cur_id is not None and not done:
-                    with self._lock:
-                        self.stat["incomplete"] += 1
+                if cur_id is not None:
+                    back = (cur_id - fid) & 0xFFFF
+                    if 0 < back <= LATE_WINDOW:
+                        continue
+                    if LATE_WINDOW < back < 0x8000:
+                        _log(f"So khung nhay tu {cur_id} ve {fid}: ESP vua khoi dong lai -> nhan luong moi")
+                    if not done:
+                        with self._lock:
+                            self.stat["incomplete"] += 1
                 cur_id, chunks, total, done = fid, {}, tot, False
 
             if done:
@@ -156,8 +243,8 @@ class ThreadedCamera:
 
                 if frame is not None:
                     h, w = frame.shape[:2]
-                    now = time.monotonic()
                     with self._lock:
+                        gap = None if self._last_new_frame_time is None else now - self._last_new_frame_time
                         self.stat["ok"] += 1
                         self._frame_id += 1
                         self.frame = frame
@@ -166,9 +253,25 @@ class ThreadedCamera:
                         self.ret = True
                         self._last_new_frame_time = now
                         self._frame_buffer.append((self._frame_id, frame))
+                    if gap is None:
+                        _log(f"Da co hinh tu {sender_ip} ({w}x{h})")
+                    elif gap > self.stale_timeout:
+                        _log(f"Da BAT LAI hinh tu {sender_ip} sau {gap:.1f}s mat hinh ({w}x{h})")
+                    self._esp_status = ""
                 else:
                     with self._lock:
                         self.stat["badjpg"] += 1
+
+    def _learn_ip(self, ip, what):
+        with self._lock:
+            old = self.target_ip
+            if old == ip:
+                return
+            self.target_ip = ip
+        if old is None:
+            _log(f"Da tim thay ESP32 cam tai IP {ip} ({what})")
+        else:
+            _log(f"ESP32 cam DOI IP: {old} -> {ip} ({what}); lenh xe cung gui sang IP moi")
 
     def start(self):
         if self._net_thread is None or not self._net_thread.is_alive():
@@ -186,16 +289,11 @@ class ThreadedCamera:
             return
         self._stream_on = on
         if on:
-            with self._lock:
-                current_ip = self.target_ip
-            try:
-                if current_ip:
-                    self.sock.sendto(b"HELLO 0", (current_ip, self.port))
-                else:
-                    for b_ip in self.broadcast_ips:
-                        self.sock.sendto(b"HELLO 0", (b_ip, self.port))
-            except OSError:
-                pass
+            self._stream_on_since = time.monotonic()
+            self._diag_t = 0.0
+            self._send_hello(0, broadcast=True)
+            if self._send_err:
+                _log(self._send_err)
 
     def read(self):
         with self._lock:

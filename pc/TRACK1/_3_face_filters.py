@@ -43,7 +43,7 @@ def head_pose(face_info):
     return {'label': label, 'yaw': float(yaw), 'pitch': float(pitch), 'roll': float(roll)}
 
 #============================================================
-# LỌC ẢNH CHO AI ĐOÁN
+# LỌC ĐỘ NÉT ẢNH MẶT TRƯỚC KHI NHẬN DIỆN
 #============================================================
 def is_sharp_face(bgr_frame, face_box, blur_thresh=None, min_size=None):
     if blur_thresh is None:

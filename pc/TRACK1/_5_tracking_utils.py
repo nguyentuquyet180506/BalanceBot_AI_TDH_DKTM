@@ -6,7 +6,6 @@ import numpy as np
 
 from _3_face_filters import compute_encoding, head_pose
 
-# HÀM TIỆN ÍCH                                                 
 def get_box_center(box):
     if box is None:
         return None
@@ -26,9 +25,6 @@ def match_face_to_person(face_center, persons):
                 best_tid = t_id
 
     return best_tid
-
-
-# ĐĂNG KÝ MẶT (QUÉT 10 GIÂY ĐA GÓC)
 
 def capture_multi_angle_encodings_10s(
     cam_stream, clean_name, main_win,

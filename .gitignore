@@ -6,4 +6,6 @@
 compile_commands.json
 __pycache__/
 *.pyc
-pc/TRACK1/face_encodings.json
+pc/TRACK1/face_data/
+pc/TRACK1/face_encodings.json*
+*_encodings.npy

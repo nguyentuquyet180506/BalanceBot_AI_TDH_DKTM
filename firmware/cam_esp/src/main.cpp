@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <stdarg.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
@@ -11,16 +12,16 @@
 #include "web_page.h"
 
 // ====== WIFI ======
-const char *WIFI_SSID = "hoilamgi";
-const char *WIFI_PASS = "khongbiet";
-#define WIFI_TX_POWER     WIFI_POWER_11dBm
+const char *WIFI_SSID = "hoilamgi";  
+const char *WIFI_PASS = "khongbiet"; 
+#define WIFI_TX_POWER     WIFI_POWER_15dBm   
 #define USE_STATIC_IP     1
-static const IPAddress ROUTER_STATIC_IP(192, 168, 1, 200);
-static const IPAddress ROUTER_GATEWAY(192, 168, 1, 1);
+static const IPAddress ROUTER_STATIC_IP(10, 58, 164, 200);
+static const IPAddress ROUTER_GATEWAY(10, 58, 164, 129);
 static const IPAddress ROUTER_SUBNET(255, 255, 255, 0);
-static const IPAddress ROUTER_DNS(192, 168, 1, 1);
-const char *AP_SSID = "BalanceBot-Web";
-const char *AP_PASS = "balance123";
+static const IPAddress ROUTER_DNS(10, 58, 164, 129);
+const char *AP_SSID = "BalanceBot-Web";  
+const char *AP_PASS = "balance123";  
 #define AP_ALWAYS_ON      1
 #define MDNS_NAME         "balancebot"
 
@@ -32,6 +33,10 @@ const char *AP_PASS = "balance123";
 #define MAX_FRAME_BYTES   100000
 #define PKTS_PER_TICK     3
 #define FRAME_SEND_TIMEOUT_MS 150
+#define CAM_REINIT_AFTER  2
+#define CAM_RETRY_MS      5000
+#define REASON_LOG_MS     2000
+#define STATUS_TX_MS      1000
 
 // ====== CPU ======
 #define CPU_MHZ_STREAM    160
@@ -41,9 +46,9 @@ const char *AP_PASS = "balance123";
 struct Tier { uint8_t fps; uint8_t xclkMHz; uint8_t quality; float enterC; };
 static const Tier TIERS[] = {
   {  7, 10, 15,  0.0f },
-  {  6,  9, 18, 55.0f },
-  {  5,  8, 24, 62.0f },
-  {  4,  8, 29, 70.0f },
+  {  6,  9, 18, 62.0f },
+  {  5,  8, 24, 70.0f },
+  {  4,  8, 29, 75.0f },
 };
 
 #define NUM_TIERS         (sizeof(TIERS) / sizeof(TIERS[0]))
@@ -72,7 +77,7 @@ static const Tier TIERS[] = {
 #define HREF_GPIO_NUM  7
 #define PCLK_GPIO_NUM  13
 
-// ====== DIEU KHIEN XE (chuyen tu ESP can bang sang) ======
+// ====== DIEU KHIEN XE ======
 #define DRIVE_TIMEOUT_MS   600
 #define SESSION_TIMEOUT_MS 3000
 
@@ -96,6 +101,9 @@ static volatile uint8_t qualityOffset = 0;
 
 static QueueHandle_t frameQ = NULL;
 static bool cameraInStandby = false;
+static volatile bool camReady = false;
+static esp_err_t camInitErr = ESP_OK;
+static SemaphoreHandle_t fbMutex = NULL;
 
 static temperature_sensor_handle_t tempSensor = NULL;
 static float chipTempC = 0.0f;
@@ -103,6 +111,57 @@ static float chipTempC = 0.0f;
 static uint16_t frameId = 0;
 static volatile uint32_t statCaptured = 0, statQDrop = 0, statSent = 0, statBad = 0, statSendFail = 0, statNoMem = 0;
 static volatile uint32_t avgFrameBytes = 0, avgSendMs = 0;
+
+// ====== LOG LY DO KHONG GUI DUOC ANH (Serial + gui ve PC) ======
+enum CamReason : uint8_t { R_INIT, R_FBGET, R_JPEG, R_SEND_NOMEM, R_SEND_ERR, R_NO_WIFI, R_REINIT, R_COUNT };
+static uint32_t reasonLastMs[R_COUNT] = {};
+static uint32_t reasonSkipped[R_COUNT] = {};
+static uint32_t statusLastMs = 0;
+static char lastReason[128] = "";
+static volatile uint32_t lastReasonMs = 0;
+static portMUX_TYPE reasonMux = portMUX_INITIALIZER_UNLOCKED;
+
+static void sendStatus(const char *msg) {
+  sockaddr_in dst;
+  portENTER_CRITICAL(&clientMux);
+  dst = clientAddr;
+  portEXIT_CRITICAL(&clientMux);
+  if (udpSock < 0 || dst.sin_port == 0) return;
+  char b[160];
+  int n = snprintf(b, sizeof(b), "ESP32_CAM_STATUS %s", msg);
+  if (n > 0) sendto(udpSock, b, n < (int)sizeof(b) ? n : (int)sizeof(b) - 1, 0, (const sockaddr *)&dst, sizeof(dst));
+}
+
+static void camReason(CamReason r, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void camReason(CamReason r, const char *fmt, ...) {
+  char msg[128];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(msg, sizeof(msg), fmt, ap);
+  va_end(ap);
+  uint32_t now = millis();
+  bool doPrint = false, doSend = false;
+  uint32_t skipped = 0;
+  portENTER_CRITICAL(&reasonMux);
+  if (reasonLastMs[r] == 0 || now - reasonLastMs[r] >= REASON_LOG_MS) {
+    doPrint = true;
+    skipped = reasonSkipped[r];
+    reasonSkipped[r] = 0;
+    reasonLastMs[r] = now ? now : 1;
+  } else {
+    reasonSkipped[r] = reasonSkipped[r] + 1;
+  }
+  if (now - statusLastMs >= STATUS_TX_MS) { doSend = true; statusLastMs = now; }
+  memcpy(lastReason, msg, sizeof(lastReason));
+  lastReason[sizeof(lastReason) - 1] = 0;
+  lastReasonMs = now;
+  portEXIT_CRITICAL(&reasonMux);
+  if (doPrint) {
+    if (skipped) Serial.printf("[ANH] %s (+%lu lan trong %u s qua)\n", msg, (unsigned long)skipped, (unsigned)(REASON_LOG_MS / 1000));
+    else Serial.printf("[ANH] %s\n", msg);
+  }
+  if (doSend) sendStatus(msg);
+}
 
 // ====== NHIET DO ======
 static void initTempSensor() {
@@ -236,8 +295,9 @@ static bool initCamera() {
     cam.xclk_freq_hz = 20000000;
     err = esp_camera_init(&cam);
   }
+  camInitErr = err;
   if (err != ESP_OK) {
-    Serial.printf("[-] Khoi tao camera that bai, ma loi 0x%x\n", err);
+    Serial.printf("[-] Khoi tao camera that bai, ma loi 0x%x (%s)\n", err, esp_err_to_name(err));
     return false;
   }
 
@@ -258,16 +318,17 @@ static bool initCamera() {
   return true;
 }
 
-static bool isValidJpeg(const camera_fb_t *fb) {
-  if (!fb || fb->format != PIXFORMAT_JPEG) return false;
-  if (fb->len < 100 || fb->len > MAX_FRAME_BYTES) return false;
-  if (fb->buf[0] != 0xFF || fb->buf[1] != 0xD8) return false;
+static const char *jpegProblem(const camera_fb_t *fb) {
+  if (!fb || fb->format != PIXFORMAT_JPEG) return "khung khong phai JPEG";
+  if (fb->len < 100) return "khung qua nho (< 100 B)";
+  if (fb->len > MAX_FRAME_BYTES) return "khung qua lon (> MAX_FRAME_BYTES)";
+  if (fb->buf[0] != 0xFF || fb->buf[1] != 0xD8) return "thieu dau JPEG FFD8";
   size_t n = fb->len;
   size_t from = (n > 8) ? n - 8 : 1;
   for (size_t i = n - 1; i >= from && i >= 1; i--) {
-    if (fb->buf[i - 1] == 0xFF && fb->buf[i] == 0xD9) return true;
+    if (fb->buf[i - 1] == 0xFF && fb->buf[i] == 0xD9) return NULL;
   }
-  return false;
+  return "thieu duoi JPEG FFD9 (khung bi cat)";
 }
 
 // ====== UDP (lwip socket, dung chung cho nhan HELLO va gui frame) ======
@@ -282,16 +343,23 @@ static void udpOpen() {
   bind(udpSock, (sockaddr *)&a, sizeof(a));
 }
 
+static int sendErrno = 0;
+static bool sendErrNoMem = false;
+static uint16_t sendErrPkt = 0, sendErrTotal = 0;
+
 static bool sendPacket(const uint8_t *p, size_t n, const sockaddr_in &dst, uint32_t deadline) {
   for (;;) {
     int r = sendto(udpSock, p, n, 0, (const sockaddr *)&dst, sizeof(dst));
     if (r == (int)n) return true;
-    if (errno == ENOMEM || errno == ENOBUFS || errno == EAGAIN) {
+    int e = errno;
+    if (e == ENOMEM || e == ENOBUFS || e == EAGAIN) {
       statNoMem = statNoMem + 1;
-      if ((int32_t)(millis() - deadline) >= 0) return false;
+      if ((int32_t)(millis() - deadline) >= 0) { sendErrno = e; sendErrNoMem = true; return false; }
       vTaskDelay(1);
       continue;
     }
+    sendErrno = e;
+    sendErrNoMem = false;
     return false;
   }
 }
@@ -316,7 +384,11 @@ static bool sendFrame(const camera_fb_t *fb) {
     pkt[4] = total & 0xFF;  pkt[5] = total >> 8;
     pkt[6] = plen & 0xFF;   pkt[7] = plen >> 8;
     memcpy(pkt + HEADER_SIZE, fb->buf + offset, plen);
-    if (!sendPacket(pkt, HEADER_SIZE + plen, dst, deadline)) return false;
+    if (!sendPacket(pkt, HEADER_SIZE + plen, dst, deadline)) {
+      sendErrPkt = i;
+      sendErrTotal = total;
+      return false;
+    }
     offset += plen;
     if ((i % PKTS_PER_TICK) == PKTS_PER_TICK - 1) vTaskDelay(1);
   }
@@ -361,10 +433,12 @@ static void handleHello(const char *buf, const sockaddr_in &from) {
   if (changed) {
     Serial.print("Client: ");
     Serial.print(IPAddress(from.sin_addr.s_addr));
-    Serial.printf(":%u\n", ntohs(from.sin_port));
+    Serial.printf(":%u -> bat stream anh\n", ntohs(from.sin_port));
   }
   lastClientMs = millis();
   setStreaming(true);
+  if (!camReady) camReason(R_INIT, "PC xin anh nhung camera CHUA KHOI TAO DUOC (loi 0x%x %s) - dang thu lai moi %u s",
+                           (unsigned)camInitErr, esp_err_to_name(camInitErr), (unsigned)(CAM_RETRY_MS / 1000));
 }
 
 static void sendBeacon() {
@@ -393,14 +467,43 @@ static void pushLatest(camera_fb_t *fb) {
 }
 
 // ====== TASK CAPTURE (core 1): lay frame theo nhip FPS cua tang nhiet ======
+static bool restartCamera() {
+  xSemaphoreTake(fbMutex, portMAX_DELAY);
+  flushQueue();
+  if (camReady) esp_camera_deinit();
+  camReady = initCamera();
+  xSemaphoreGive(fbMutex);
+  if (camReady) applySensorSettings(true);
+  return camReady;
+}
+
 static void captureTask(void *) {
   uint32_t nextGrab = 0;
   int warmup = 0;
+  uint32_t fbFail = 0;
+  uint32_t lastInitTry = 0;
   for (;;) {
+    if (!camReady) {
+      if (hasClient && (lastInitTry == 0 || millis() - lastInitTry >= CAM_RETRY_MS)) {
+        lastInitTry = millis();
+        if (restartCamera()) {
+          camReason(R_REINIT, "Camera da khoi tao lai thanh cong -> gui anh tiep");
+          fbFail = 0;
+          warmup = WARMUP_FRAMES;
+          nextGrab = 0;
+        } else {
+          camReason(R_INIT, "Camera KHOI TAO LOI 0x%x (%s) - kiem tra cap camera / nguon 5V; thu lai sau %u s",
+                    (unsigned)camInitErr, esp_err_to_name(camInitErr), (unsigned)(CAM_RETRY_MS / 1000));
+        }
+      }
+      vTaskDelay(pdMS_TO_TICKS(100));
+      continue;
+    }
     if (!hasClient) {
       if (!cameraInStandby) {
         flushQueue();
         cameraSleep();
+        fbFail = 0;
       }
       vTaskDelay(pdMS_TO_TICKS(100));
       continue;
@@ -425,9 +528,23 @@ static void captureTask(void *) {
     camera_fb_t *fb = esp_camera_fb_get();
     if (!fb) {
       statBad = statBad + 1;
+      fbFail = fbFail + 1;
+      camReason(R_FBGET, "Khong lay duoc anh tu camera (esp_camera_fb_get tra NULL %lu lan lien tiep: cam bien khong ra khung, "
+                "XCLK / cap camera / nguon?)", (unsigned long)fbFail);
+      if (fbFail >= CAM_REINIT_AFTER) {
+        if (restartCamera())
+          camReason(R_REINIT, "Camera treo -> da khoi dong lai camera (deinit + init, giu nguyen thong so)");
+        else
+          camReason(R_REINIT, "Camera treo -> khoi dong lai THAT BAI 0x%x (%s), se thu lai", (unsigned)camInitErr, esp_err_to_name(camInitErr));
+        fbFail = 0;
+        warmup = WARMUP_FRAMES;
+        nextGrab = 0;
+        continue;
+      }
       vTaskDelay(pdMS_TO_TICKS(10));
       continue;
     }
+    fbFail = 0;
     uint32_t interval = 1000 / ctlFps();
     nextGrab = millis() + interval;
 
@@ -437,8 +554,10 @@ static void captureTask(void *) {
       nextGrab = 0;
       continue;
     }
-    if (!isValidJpeg(fb)) {
+    const char *bad = jpegProblem(fb);
+    if (bad) {
       statBad = statBad + 1;
+      camReason(R_JPEG, "Bo khung camera hong: %s (%u B, gioi han %u B)", bad, (unsigned)fb->len, (unsigned)MAX_FRAME_BYTES);
       esp_camera_fb_return(fb);
       continue;
     }
@@ -451,19 +570,36 @@ static void captureTask(void *) {
 static void sendTask(void *) {
   for (;;) {
     camera_fb_t *fb = NULL;
-    if (xQueueReceive(frameQ, &fb, pdMS_TO_TICKS(200)) != pdTRUE) continue;
+    if (xQueuePeek(frameQ, &fb, pdMS_TO_TICKS(200)) != pdTRUE) continue;
+    xSemaphoreTake(fbMutex, portMAX_DELAY);
+    if (xQueueReceive(frameQ, &fb, 0) != pdTRUE) {
+      xSemaphoreGive(fbMutex);
+      continue;
+    }
     if (!hasClient) {
       esp_camera_fb_return(fb);
+      xSemaphoreGive(fbMutex);
       continue;
     }
     uint32_t t0 = millis();
     size_t len = fb->len;
     bool ok = sendFrame(fb);
     esp_camera_fb_return(fb);
+    xSemaphoreGive(fbMutex);
     uint32_t dt = millis() - t0;
     avgSendMs = (avgSendMs * 7 + dt) / 8;
     avgFrameBytes = (avgFrameBytes * 7 + len) / 8;
     if (ok) statSent = statSent + 1; else statSendFail = statSendFail + 1;
+    if (!ok) {
+      if (WiFi.status() != WL_CONNECTED && WiFi.softAPgetStationNum() == 0)
+        camReason(R_NO_WIFI, "Khong gui duoc anh: MAT WiFi (router trang thai %d, khong ai noi AP)", (int)WiFi.status());
+      else if (sendErrNoMem)
+        camReason(R_SEND_NOMEM, "Bo khung %u B: het bo dem WiFi qua %u ms (moi gui %u/%u goi) - song yeu / mang nghen / PC nhan cham",
+                  (unsigned)len, (unsigned)FRAME_SEND_TIMEOUT_MS, (unsigned)sendErrPkt, (unsigned)sendErrTotal);
+      else
+        camReason(R_SEND_ERR, "Gui UDP loi errno %d (%s) o goi %u/%u -> bo khung (PC doi IP / mang khong toi duoc PC?)",
+                  sendErrno, strerror(sendErrno), (unsigned)sendErrPkt, (unsigned)sendErrTotal);
+    }
   }
 }
 
@@ -593,7 +729,7 @@ static void linkFire(uint8_t type, T &m) {
 }
 
 // ====================================================================
-// ====== WEB (chuyen tu ESP can bang sang): CHI CHUYEN LENH VA DOC TRANG THAI ======
+// ====== WEB: CHI CHUYEN LENH VA DOC TRANG THAI ======
 WebServer server(80);
 String ownerToken;
 uint32_t ownerSeen = 0, ownerSeq = 0;
@@ -794,7 +930,7 @@ void startWeb() {
 }
 
 // ====================================================================
-// ====== LENH XE QUA UDP (chuyen tu ESP can bang sang) ======
+// ====== LENH XE QUA UDP ======
 static void udpReply(const sockaddr_in &to) {
   char b[96];
   int n = snprintf(b, sizeof(b), "T,%d,%d,%d,%d,%.2f,%.0f,%.1f", teleFlag(rl::F_ARMED) ? 1 : 0,
@@ -887,6 +1023,7 @@ static void waitUdp(uint32_t ms) {
 }
 
 // ====================================================================
+// ====== WI-FI AP, KHOI TAO VA VONG LAP CHINH ======
 static void startAP() {
   WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
   if (WiFi.softAP(AP_SSID, AP_PASS, 1, 0, 4)) {
@@ -917,17 +1054,21 @@ static void serviceWiFi() {
       staLost = false;
       WiFi.setTxPower(WIFI_TX_POWER);
       Serial.print("[+] Da ket noi lai WiFi. IP ESP32: ");
-      Serial.println(WiFi.localIP());
+      Serial.print(WiFi.localIP());
+      Serial.println(" (PC tu do lai IP qua HELLO broadcast)");
     }
     return;
   }
   uint32_t now = millis();
   if (!staLost) {
     staLost = true;
-    Serial.println("Mat WiFi, dang ket noi lai...");
+    Serial.printf("[ANH] Mat WiFi router '%s' (trang thai %d) -> ngung gui anh, dang ket noi lai (PC noi AP '%s' van xem duoc)\n",
+                  WIFI_SSID, (int)WiFi.status(), AP_SSID);
     setStreaming(false);
   } else if (now - tryMs < 15000) {
     return;
+  } else {
+    Serial.printf("[ANH] Van chua noi lai WiFi '%s' (trang thai %d) - PC qua router chua co anh\n", WIFI_SSID, (int)WiFi.status());
   }
   tryMs = now;
   WiFi.disconnect();
@@ -971,16 +1112,18 @@ void setup() {
   initTempSensor();
 
   frameQ = xQueueCreate(1, sizeof(camera_fb_t *));
+  fbMutex = xSemaphoreCreateMutex();
   udpOpen();
 
-  if (!initCamera()) {
-    Serial.println("[-] Loi khoi tao camera! Kiem tra lai cap/chan.");
+  camReady = initCamera();
+  if (!camReady) {
+    Serial.println("[-] Loi khoi tao camera! Kiem tra lai cap/chan. Se tu thu lai moi 5 s khi PC xin anh.");
   } else {
     Serial.println("[+] Camera san sang!");
     cameraSleep();
-    xTaskCreatePinnedToCore(captureTask, "capture", 4096, NULL, 2, NULL, 1);
-    xTaskCreatePinnedToCore(sendTask, "send", 4096, NULL, 2, NULL, 0);
   }
+  xTaskCreatePinnedToCore(captureTask, "capture", 4096, NULL, 2, NULL, 1);
+  xTaskCreatePinnedToCore(sendTask, "send", 4096, NULL, 2, NULL, 0);
 
   powerHigh = true;
   applyPower(false);
@@ -1023,7 +1166,15 @@ void loop() {
     if (tempSensor) Serial.printf(" | chip %.1fC tang %u q%d", chipTempC, thermalLevel, ctlQuality());
     Serial.printf(" | UART %s khung %lu loi %lu", linkFresh() ? "OK" : "MAT",
                   (unsigned long)linkParser.frames, (unsigned long)linkParser.errors);
+    if (!camReady) Serial.print(" | CAMERA LOI");
     Serial.println(hasClient ? "" : " [IDLE]");
+    if (lastReasonMs && now - lastReasonMs < 10000) {
+      char r[128];
+      portENTER_CRITICAL(&reasonMux);
+      memcpy(r, lastReason, sizeof(r));
+      portEXIT_CRITICAL(&reasonMux);
+      Serial.printf("      ^ loi anh gan nhat: %s\n", r);
+    }
   }
 
   if (!hasClient) {

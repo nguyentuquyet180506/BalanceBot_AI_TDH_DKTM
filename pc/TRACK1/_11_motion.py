@@ -18,6 +18,8 @@ class FollowController:
         self._err = 0.0
         self._allow_back = True
         self.last_side = 0.0
+        self.last_v = 0.0
+        self.last_hr = 0.0
         self.dbg = ""
 
     @property
@@ -49,7 +51,7 @@ class FollowController:
         if self._turning:
             base = db - cfg.FOLLOW_X_HYST
             mag = min(1.0, max(0.0, (abs(ex) - base) / (1.0 - base)))
-            w = -_sign(ex) * cfg.FOLLOW_TURN_SIGN * min(1.0, cfg.FOLLOW_KW * mag) * w_max
+            w = _sign(ex) * cfg.FOLLOW_TURN_SIGN * min(1.0, cfg.FOLLOW_KW * mag) * w_max
 
         # ── Tiến / lùi theo cỡ người (xa -> box thấp -> tiến; gần -> box cao -> lùi) ──
         err = (cfg.FOLLOW_TARGET_H - hr) / cfg.FOLLOW_TARGET_H
@@ -71,6 +73,7 @@ class FollowController:
         if v > 0:
             v *= max(0.0, 1.0 - cfg.FOLLOW_TURN_SLOWDOWN * abs(ex))
         self.dbg = f"lech {ex:+.2f} cao {hr:.2f}"
+        self.last_v, self.last_hr = v, hr
         return v, w
 
 
@@ -171,16 +174,48 @@ class SearchPlanner:
         self.reset()
 
     def reset(self):
-        self._next = None
+        self._phase = "settle"
+        self._t = None
         self.turns = 0
+        self._looked = {}
 
-    def update(self, now, lost_since, side, link, w=None):
+    def _look(self, now, people):
+        best = None
+        for tid in people:
+            left = cfg.SEARCH_LOOK_TIME - (now - self._looked.setdefault(tid, now))
+            if left > 0 and (best is None or left > best[1]):
+                best = (tid, left)
+        return best
+
+    def update(self, now, lost_since, side, link, w=None, people=()):
         waited = now - lost_since
         if waited < cfg.SEARCH_START_DELAY:
             return f"mat dau {waited:.1f}s"
         direction = -side * cfg.FOLLOW_TURN_SIGN if side else 1
-        if self._next is None or now >= self._next:
-            link.turn_by(cfg.SEARCH_TURN_DEG, max(5.0, w or cfg.SEARCH_TURN_W), direction)
-            self._next = now + cfg.SEARCH_PERIOD
-            self.turns += 1
-        return f"quay tim lan {self.turns} ({'trai' if direction > 0 else 'phai'}) | lan sau {max(0.0, self._next - now):.1f}s"
+        dname = "trai" if direction > 0 else "phai"
+        looking = self._look(now, people)
+        if self._phase == "turn":
+            if link.busy:
+                return f"xoay tai cho {cfg.SEARCH_TURN_DEG} do ({dname}) lan {self.turns}"
+            self._phase, self._t = "settle", now
+        look_msg = None if looking is None else f"THAY NGUOI (ID {looking[0]}) - dung yen nhin xac nhan, con {looking[1]:.1f}s"
+        if self._phase == "settle":
+            if self._t is None:
+                self._t = now
+            if not link.is_still(cfg.SEARCH_STILL_V) and now - self._t < cfg.SEARCH_STILL_MAX_WAIT:
+                return look_msg or "cho xe dung han roi moi xoay tai cho"
+            if self.turns == 0:
+                self._phase = "go"
+            else:
+                self._phase, self._t = "pause", now
+        if self._phase == "pause":
+            left = cfg.SEARCH_PAUSE - (now - self._t)
+            if left > 0:
+                return look_msg or f"dung yen tim chu {left:.1f}s (da xoay {self.turns} lan x {cfg.SEARCH_TURN_DEG} do)"
+            self._phase = "go"
+        if look_msg:
+            return look_msg
+        link.turn_by(cfg.SEARCH_TURN_DEG, max(5.0, w or cfg.SEARCH_TURN_W), direction)
+        self.turns += 1
+        self._phase, self._t = "turn", now
+        return f"xoay tai cho {cfg.SEARCH_TURN_DEG} do ({dname}) lan {self.turns}"

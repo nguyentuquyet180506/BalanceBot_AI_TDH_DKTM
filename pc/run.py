@@ -3,12 +3,12 @@
 HỆ THỐNG ROBOT CÂN BẰNG + AI BÁM NGƯỜI — KHỞI CHẠY PHẦN MÁY TÍNH (1 LỆNH)
 
 CÁCH DÙNG:
-  python run.py                  -> Mở chương trình chính (mặc định chế độ 4: xem cam, không AI)
-  python run.py --mode 3         -> Mở thẳng chế độ 3 (bám người). 1 tay | 2 cử chỉ | 3 bám người | 4 cam
+  python run.py                  -> Mở chương trình chính (mặc định chế độ 3: xem cam, không AI)
+  python run.py --mode 5         -> Mở thẳng chế độ 5. 1 tay | 2 cử chỉ | 3 cam | 4 bám người áo+quần | 5 bám người áo+quần+tay áo khác màu
   python run.py <IP_ESP_CAM>     -> Chỉ định IP ESP cam (vd 192.168.4.1 khi nối Wi-Fi AP của xe)
   python run.py --view           -> Chỉ xem camera (tools/receiver.py, không AI, không lái)
   python run.py --control        -> Chỉ mở cửa sổ cần gạt UDP (balancebot_udp.py)
-Đang chạy vẫn đổi chế độ được: gõ 1 / 2 / 3 / 4 rồi Enter trong terminal (hoặc phím số trên cửa sổ video).
+Đang chạy vẫn đổi chế độ được: gõ 1 / 2 / 3 / 4 / 5 rồi Enter trong terminal (hoặc phím số trên cửa sổ video).
 
 Nạp firmware KHÔNG nằm ở đây: dùng upload_balance.bat / upload_cam.bat ở thư mục gốc (2 lệnh độc lập).
 """
@@ -75,7 +75,7 @@ def main():
         print("==========================================================")
         print(" [*] ĐANG KHỞI ĐỘNG HỆ THỐNG ROBOT (camera UDP + AI + điều khiển)...")
         print("     -> Tự dò ESP cam qua beacon UDP cổng 4210 (hoặc truyền IP).")
-        print("     -> Đổi chế độ: gõ 1 / 2 / 3 / 4 + Enter tại đây.")
+        print("     -> Đổi chế độ: gõ 1 / 2 / 3 / 4 / 5 + Enter tại đây.")
         print("==========================================================")
         subprocess.run([python_path, TRACK1_MAIN] + passthrough, cwd=TRACK1_DIR)
 

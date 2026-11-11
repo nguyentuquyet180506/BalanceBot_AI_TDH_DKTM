@@ -12,6 +12,8 @@ MANUAL_IP = sys.argv[1] if len(sys.argv) > 1 and sys.argv[1] != "auto" else None
 ESP_PORT = 4210
 HDR = struct.Struct("<HHHH")
 WINDOW = "ESP32-S3 UDP Camera"
+LATE_WINDOW = 16
+REDISCOVER_AFTER = 3.0
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
@@ -24,6 +26,8 @@ target_ip = MANUAL_IP
 state_lock = threading.Lock()
 
 stat = {"ok": 0, "incomplete": 0, "qdrop": 0, "badjpg": 0, "shown": 0}
+last_frame_t = [time.time()]
+esp_status = [""]
 
 frame_q: "queue.Queue[bytes]" = queue.Queue(maxsize=1)
 
@@ -53,17 +57,13 @@ def keepalive():
         prev_ok, prev_bad = ok, bad
         loss = int(100 * d_bad / (d_ok + d_bad)) if (d_ok + d_bad) else 0
         msg = b"HELLO %d" % loss
-        try:
-            if current:
-                sock.sendto(msg, (current, ESP_PORT))
-            else:
-                for b_ip in broadcast_ips:
-                    try:
-                        sock.sendto(msg, (b_ip, ESP_PORT))
-                    except OSError:
-                        pass
-        except OSError:
-            pass
+        lost = time.time() - last_frame_t[0] >= REDISCOVER_AFTER
+        dests = ([current] if current else []) + (broadcast_ips if (lost or not current) else [])
+        for d in dests:
+            try:
+                sock.sendto(msg, (d, ESP_PORT))
+            except OSError:
+                pass
         time.sleep(1)
 
 
@@ -95,34 +95,49 @@ def net_loop():
             data, addr = sock.recvfrom(2048)
         except socket.timeout:
             continue
-        except OSError:
-            break
+        except ConnectionResetError:
+            continue
+        except OSError as e:
+            if stop_event.is_set():
+                break
+            print(f"[!] Loi socket: {e} -> thu tiep")
+            time.sleep(0.5)
+            continue
 
         sender_ip = addr[0]
 
-        if data.startswith(b"ESP32_CAM_BEACON"):
+        if data.startswith(b"ESP32_CAM_"):
             with state_lock:
                 if target_ip != sender_ip:
+                    print(f"[+] ESP32-S3 tai IP: {sender_ip}" + (f" (doi tu {target_ip})" if target_ip else ""))
                     target_ip = sender_ip
-                    print(f"[+] Da phat hien ESP32-S3 tai IP: {sender_ip}")
+            if data.startswith(b"ESP32_CAM_STATUS"):
+                txt = data[16:].decode("ascii", "replace").strip()
+                if txt != esp_status[0]:
+                    print(f"[ESP bao] {txt}")
+                    esp_status[0] = txt
             continue
 
         if len(data) < HDR.size:
             continue
-
-        with state_lock:
-            if target_ip is None:
-                target_ip = sender_ip
-                print(f"[+] Da nhan stream tu ESP32 tai IP: {sender_ip}")
 
         fid, idx, tot, plen = HDR.unpack_from(data)
         payload = data[HDR.size : HDR.size + plen]
         if len(payload) != plen or tot == 0 or idx >= tot:
             continue
 
+        with state_lock:
+            if target_ip != sender_ip:
+                print(f"[+] Da nhan stream tu ESP32 tai IP: {sender_ip}" + (f" (doi tu {target_ip})" if target_ip else ""))
+                target_ip = sender_ip
+
         if cur_id is None or fid != cur_id:
-            if cur_id is not None and ((fid - cur_id) & 0xFFFF) >= 0x8000:
-                continue
+            if cur_id is not None:
+                back = (cur_id - fid) & 0xFFFF
+                if 0 < back <= LATE_WINDOW:
+                    continue
+                if LATE_WINDOW < back < 0x8000:
+                    print(f"[+] So khung nhay {cur_id} -> {fid}: ESP vua khoi dong lai, nhan luong moi")
             if cur_id is not None and not done:
                 with state_lock:
                     stat["incomplete"] += 1
@@ -136,6 +151,10 @@ def net_loop():
             done = True
             with state_lock:
                 stat["ok"] += 1
+            if time.time() - last_frame_t[0] > 3.0:
+                print(f"[+] Da BAT LAI hinh tu {sender_ip} sau {time.time() - last_frame_t[0]:.1f}s")
+            last_frame_t[0] = time.time()
+            esp_status[0] = ""
             push_latest(b"".join(chunks[i] for i in range(total)))
 
 
@@ -243,6 +262,10 @@ def main():
                 f"[ESP32 {ip}] hien thi {s['shown'] / elapsed:.1f} FPS | "
                 f"tong frame day du {s['ok']} | mat goi {s['incomplete']} | bo (queue) {s['qdrop']} | JPEG loi {s['badjpg']}"
             )
+            gap = time.time() - last_frame_t[0]
+            if gap > REDISCOVER_AFTER:
+                print(f"[!] KHONG CO HINH {gap:.0f}s: " + (f"ESP bao: {esp_status[0]}" if esp_status[0] else
+                      "khong nhan duoc anh (ESP tat / dang khoi dong / khac mang Wi-Fi / tuong lua chan UDP 4210). Da gui HELLO + broadcast."))
             t0 = time.time()
 
     stop_event.set()
